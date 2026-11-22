@@ -23,6 +23,8 @@ cbuffer Params : register(b0) {
     uint g_idxSize;
     uint g_vbStride;
     uint g_vbExtent;
+    uint g_ibSubOff;
+    uint g_vbSubOff;
 };
 
 #define THREADS 1024u
@@ -49,11 +51,19 @@ void main(uint tid : SV_GroupIndex)
     for (uint i = tid; i < nIdx; i += THREADS) {
         uint v;
         if (g_idxSize == 2u) {
-            uint b = i * 2u;
+            uint b = g_ibSubOff + i * 2u;
             uint w = IB.Load(b & ~3u);
             v = (b & 2u) ? (w >> 16) : (w & 0xFFFFu);
+        } else {
+            uint b = g_ibSubOff + i * 4u;
+            if ((b & 3u) == 0u) {
+                v = IB.Load(b);
+            } else {
+                uint base = b & ~3u;
+                uint sh = (b & 3u) * 8u;
+                v = (IB.Load(base) >> sh) | (IB.Load(base + 4u) << (32u - sh));
+            }
         }
-        else                 { v = IB.Load(i * 4u); }
         localMax = max(localMax, v);
     }
     InterlockedMax(gMax, localMax);
@@ -69,17 +79,39 @@ void main(uint tid : SV_GroupIndex)
     const uint hi = min(lo + slice, vbBytes);
     uint crc = 0xFFFFFFFFu;
     uint j = lo;
-    for (; j + 4u <= hi; j += 4u) {
-        uint w = VB.Load(j);
-        crc = crc_byte(crc, w);
-        crc = crc_byte(crc, w >> 8);
-        crc = crc_byte(crc, w >> 16);
-        crc = crc_byte(crc, w >> 24);
-    }
-    if (j < hi) {
-        uint w = VB.Load(j);
-        uint s = 0u;
-        for (; j < hi; ++j, s += 8u) crc = crc_byte(crc, w >> s);
+    if (g_vbSubOff == 0u) {
+        for (; j + 4u <= hi; j += 4u) {
+            uint w = VB.Load(j);
+            crc = crc_byte(crc, w);
+            crc = crc_byte(crc, w >> 8);
+            crc = crc_byte(crc, w >> 16);
+            crc = crc_byte(crc, w >> 24);
+        }
+        if (j < hi) {
+            uint w = VB.Load(j);
+            uint s = 0u;
+            for (; j < hi; ++j, s += 8u) crc = crc_byte(crc, w >> s);
+        }
+    } else {
+        if (j + 4u <= hi) {
+            const uint sh = g_vbSubOff * 8u;
+            const uint rsh = 32u - sh;
+            uint cur = VB.Load(j);
+            for (; j + 4u <= hi; j += 4u) {
+                uint nxt = VB.Load(j + 4u);
+                uint w = (cur >> sh) | (nxt << rsh);
+                cur = nxt;
+                crc = crc_byte(crc, w);
+                crc = crc_byte(crc, w >> 8);
+                crc = crc_byte(crc, w >> 16);
+                crc = crc_byte(crc, w >> 24);
+            }
+        }
+        for (; j < hi; ++j) {
+            uint p = g_vbSubOff + j;
+            uint w = VB.Load(p & ~3u);
+            crc = crc_byte(crc, w >> ((p & 3u) * 8u));
+        }
     }
 
     Out.Store2(8u + tid * 8u, uint2(crc ^ 0xFFFFFFFFu, hi - lo));
