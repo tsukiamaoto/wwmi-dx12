@@ -208,10 +208,8 @@ RfxBindState RfxBinder::BindThroughShadow(reshade::api::command_list* cmd_list, 
                 "RFX-MIRROR: %u of %u mirrored slot(s) had no CPU-only source record -> null SRV (param0 %u, %u table(s))",
                 misses, total, (unsigned)w.srv_param, nm);
     }
-    ID3D12DescriptorHeap* game_srv = GameHeap(cmd_list, 0);
-    ID3D12DescriptorHeap* game_smp = GameHeap(cmd_list, 1);
-    if (!game_srv) game_srv = w.srv_heap;
-    if (!game_smp) game_smp = w.smp_heap;
+    ID3D12DescriptorHeap* game_srv = w.srv_heap ? w.srv_heap : GameHeap(cmd_list, 0);
+    ID3D12DescriptorHeap* game_smp = w.smp_heap ? w.smp_heap : GameHeap(cmd_list, 1);
     ID3D12DescriptorHeap* heaps[2];
     UINT nh = 0;
     heaps[nh++] = lease.heap;
@@ -282,15 +280,17 @@ RfxBindState RfxBinder::DecideAndBind(reshade::api::command_list* cmd_list, ID3D
     int ls = -1;
     int ms = -1;
     char flags[8] = "";
-    int cls[3] = { 0, 0, 0 };
-    TexInfo td[3] = {};
-    for (int s = 0; s < 3; ++s) {
+    int cls[4] = { 0, 0, 0, 0 };
+    TexInfo td[4] = {};
+    for (int s = 0; s < 4; ++s) {
+        if (s == 3 && w.srv_count && 3u >= w.srv_count) break;
         ID3D12Resource* res = nullptr;
         {
             ResInfo ri;
             if (g_descriptors.Find(HeapKey{ heap, w.srv_base + (uint32_t)s }, ri)) res = ri.res;
         }
         if (!res) {
+            if (s == 3) continue; // t3 is optional (only consulted when t1 is MagicDot)
             if (g_debug && DiagOnce("RFX-BAIL-UNRECORDED", bail_key * 4 + s))
                 logger::write(
                     "RABBITFX-BAIL mod=%d comp=%d: the game's t%d has no recorded texture -- not classified, the game's textures stay",
@@ -394,13 +394,17 @@ RfxBindState RfxBinder::DecideAndBind(reshade::api::command_list* cmd_list, ID3D
     return st;
 }
 
-void RfxBinder::Restore(ID3D12GraphicsCommandList* cl, const RfxBindState& st) const
+void RfxBinder::Restore(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* cl, const RfxBindState& st) const
 {
     if (!st.bound || !cl) return;
-    ID3D12DescriptorHeap* heaps[2];
-    UINT nh = 0;
-    if (st.game_srv) heaps[nh++] = st.game_srv;
-    if (st.game_smp) heaps[nh++] = st.game_smp;
-    if (nh) cl->SetDescriptorHeaps(nh, heaps);
+    if (cmd_list) {
+        RestoreGameDescriptorHeaps(cmd_list);
+    } else {
+        ID3D12DescriptorHeap* heaps[2];
+        UINT nh = 0;
+        if (st.game_srv) heaps[nh++] = st.game_srv;
+        if (st.game_smp) heaps[nh++] = st.game_smp;
+        if (nh) cl->SetDescriptorHeaps(nh, heaps);
+    }
     for (const auto& t : st.tables) cl->SetGraphicsRootDescriptorTable(t.first, { t.second }); // restore ALL tables
 }

@@ -42,7 +42,7 @@ public:
         int comp_idx, D3D12_CPU_DESCRIPTOR_HANDLE dif, D3D12_CPU_DESCRIPTOR_HANDLE nor, D3D12_CPU_DESCRIPTOR_HANDLE lit,
         D3D12_CPU_DESCRIPTOR_HANDLE mat, bool gbuffer_pass, uint8_t ps_reads,
         const std::vector<WclSlotOvr>* extra = nullptr);
-    void Restore(ID3D12GraphicsCommandList* cl, const RfxBindState& st) const;
+    void Restore(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* cl, const RfxBindState& st) const;
     bool Param0Covers(
         reshade::api::command_list* cmd_list, unsigned max_reg, unsigned* base_reg, unsigned* count) const;
     void SetExtraSlots(const ShadowSlotOvr* s, unsigned n);

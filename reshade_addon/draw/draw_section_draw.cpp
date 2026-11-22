@@ -454,7 +454,7 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
         ++run.did;
         g_occl.End(d3d12_cl, oq);
     }
-    if (tbind.bound) g_rfx_bind.Restore(d3d12_cl, tbind);
+    if (tbind.bound) g_rfx_bind.Restore(cmd_list, d3d12_cl, tbind);
     if (rfxp_pso && rfxp_restore) // the patched PS wrote the glow / cutout; back to the game's PSO
         d3d12_cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(g_command_lists.Gfx(cmd_list).gfx_restore()));
     if (layout_pso)
