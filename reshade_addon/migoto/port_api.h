@@ -395,7 +395,7 @@ struct HeldBuffer {
 
 void ForEachCustomResource(void (*cb)(const wchar_t* fq_name, const wchar_t* filename, int type, bool substantiated,
                                ID3D12Resource* dx12, void* user),
-    void* user, bool (*want)(ID3D12Resource* dx12, void* user) = nullptr);
+    void* user, bool (*want)(ID3D12Resource* dx12, void* user) = nullptr, bool skip_foreign = false);
 
 // ---- what got loaded, for the overlay and for tests -------------------------------------------
 struct Stats {

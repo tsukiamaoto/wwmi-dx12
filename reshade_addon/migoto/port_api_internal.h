@@ -8,6 +8,8 @@
 #include <cstdint>
 
 class HackerDevice;
+class CommandListVariable;
+class CustomShader;
 struct TextureOverride;
 class ExplicitCommandListSection;
 class CustomResource;
@@ -53,10 +55,18 @@ void FiltersParsed();
 
 // Every variable's value, the ini params and each custom shader's runs this frame, put back after a run that is to
 // leave none of its writes (port_vars.cpp). Caller holds the engine lock across both.
+// Stored by stable element pointers (std::unordered_map guarantees pointer stability across insert/rehash, which
+// happens at runtime when a CustomResourcePool lazily registers a pool variable) and fenced by g_generation.
 struct EngineValues {
-    std::vector<float> vars;
+    struct ShaderRun {
+        CustomShader* cs;
+        unsigned frame_no;
+        int execs;
+    };
+    unsigned generation = 0;
+    std::vector<std::pair<CommandListVariable*, float>> vars;
     std::vector<DirectX::XMFLOAT4> params;
-    std::vector<std::pair<unsigned, int>> shader_runs; // frame_no, executions_this_frame
+    std::vector<ShaderRun> shader_runs; // frame_no, executions_this_frame
     void Take();
     void PutBack() const;
 };

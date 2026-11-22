@@ -24,7 +24,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="$(WwmiPristineDir)\CommandList.cpp">
+    <ClCompile Include="$(WwmiPristineDir)\CommandList.patched.cpp">
       <Filter>3Dmigoto (unmodified)</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\migoto\port_ini.cpp">

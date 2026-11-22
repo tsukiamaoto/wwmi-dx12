@@ -68,11 +68,32 @@
     </ClCompile>
   </ItemDefinitionGroup>
 
+  <UsingTask TaskName="WwmiPatchCommandList" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Source ParameterType="System.String" Required="true" />
+      <Destination ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs"><![CDATA[
+string text = File.ReadAllText(Source);
+// Upstream 3Dmigoto v1.3.3 CustomResource::AddFlags rejects extra_bind_flags == 0 on an existing CB resource,
+// dropping valid `ResourceA = ref ResourceCB` lines (e.g. skeleton pool refs) depending on INI section parse order.
+text = System.Text.RegularExpressions.Regex.Replace(
+    text,
+    @"(// Don't add non-CB flags to an existing CB resource\.\r?\n\s*)if \(bind_flags & D3D11_BIND_CONSTANT_BUFFER\)",
+    "${1}if (extra_bind_flags && (bind_flags & D3D11_BIND_CONSTANT_BUFFER))");
+if (!File.Exists(Destination) || File.ReadAllText(Destination) != text)
+    File.WriteAllText(Destination, text);
+]]></Code>
+    </Task>
+  </UsingTask>
+
   <Target Name="WwmiPristineSources" BeforeTargets="ClCompile">
     <ReadLinesFromFile File="$(WwmiRoot)reshade_addon\migoto\PRISTINE.txt">
       <Output TaskParameter="Lines" ItemName="WwmiPristineLine" />
     </ReadLinesFromFile>
     <Copy SkipUnchangedFiles="true" SourceFiles="$(WwmiRefDir)\%(WwmiPristineLine.Identity)" DestinationFolder="$(WwmiPristineDir)" Condition="!$([System.String]::Copy('%(WwmiPristineLine.Identity)').StartsWith('#'))" />
+    <WwmiPatchCommandList Source="$(WwmiPristineDir)\CommandList.cpp" Destination="$(WwmiPristineDir)\CommandList.patched.cpp" />
     <Exec Command="git -C &quot;$(WwmiRefDir)&quot; describe --tags --match v[0-9]* --abbrev=0" ConsoleToMSBuild="true" StandardOutputImportance="low" StandardErrorImportance="low" IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true">
       <Output TaskParameter="ConsoleOutput" PropertyName="WwmiRefTag" />
     </Exec>
@@ -88,7 +109,7 @@
   </Target>
 
   <ItemGroup Label="Their engine, UNMODIFIED from the submodule, plus port_globals.cpp (ours) -- NEVER edit theirs to fix our bugs">
-    <ClCompile Include="$(WwmiPristineDir)\CommandList.cpp">
+    <ClCompile Include="$(WwmiPristineDir)\CommandList.patched.cpp">
       <DisableSpecificWarnings>4244;4715;4477;4002;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <PreprocessorDefinitions>_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>

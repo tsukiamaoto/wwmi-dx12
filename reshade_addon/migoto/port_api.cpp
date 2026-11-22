@@ -346,6 +346,7 @@ static void FrameDriverConfig()
         ReloadConfig(&g_dev);
         RebuildParseSnapshots(); // THE PARSE THAT ACTUALLY LOADS THE MODS.
         BumpGeneration();
+        g_step_inputs_taken = false;
         MigotoPort::g_selection_watch.Clear();
         NotifyParse(parse_start);
     }

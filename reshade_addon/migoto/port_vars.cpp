@@ -42,28 +42,25 @@ void ForEachVariableSlot(void (*cb)(const wchar_t* fq_name, const float* slot, v
 
 void EngineValues::Take()
 {
+    generation = g_generation;
     vars.clear();
     vars.reserve(command_list_globals.size());
-    for (const auto& kv : command_list_globals) vars.push_back(kv.second.fval);
+    for (auto& kv : command_list_globals) vars.emplace_back(&kv.second, kv.second.fval);
     params = G->iniParams;
     shader_runs.clear();
     shader_runs.reserve(customShaders.size());
-    for (const auto& kv : customShaders) shader_runs.emplace_back(kv.second.frame_no, kv.second.executions_this_frame);
+    for (auto& kv : customShaders)
+        shader_runs.push_back({ &kv.second, kv.second.frame_no, kv.second.executions_this_frame });
 }
 
 void EngineValues::PutBack() const
 {
-    size_t i = 0;
-    for (auto& kv : command_list_globals) {
-        if (i == vars.size()) break;
-        kv.second.fval = vars[i++];
-    }
+    if (generation != g_generation) return;
+    for (const auto& kv : vars) kv.first->fval = kv.second;
     G->iniParams = params;
-    size_t s = 0;
-    for (auto& kv : customShaders) {
-        if (s == shader_runs.size()) break;
-        kv.second.frame_no = shader_runs[s].first;
-        kv.second.executions_this_frame = shader_runs[s++].second;
+    for (const ShaderRun& sr : shader_runs) {
+        sr.cs->frame_no = sr.frame_no;
+        sr.cs->executions_this_frame = sr.execs;
     }
 }
 
@@ -533,12 +530,13 @@ bool EvictTexture(const wchar_t* fq_name, ID3D11Resource* was)
 }
 
 void ForEachCustomResource(void (*cb)(const wchar_t*, const wchar_t*, int, bool, ID3D12Resource*, void*), void* user,
-    bool (*want)(ID3D12Resource*, void*))
+    bool (*want)(ID3D12Resource*, void*), bool skip_foreign)
 {
     if (!g_loaded || !cb) return;
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     for (auto& kv : customResources) {
         MigotoPort::WrapResource* wr = MigotoPort::AsWrapResource(kv.second.resource);
+        if (skip_foreign && wr && wr->foreign) continue;
         ID3D12Resource* dx12 = wr ? wr->dx12 : nullptr;
         if (want && !want(dx12, user)) continue;
         cb(kv.first.c_str(), kv.second.filename.c_str(), (int)kv.second.override_type, kv.second.substantiated, dx12,
