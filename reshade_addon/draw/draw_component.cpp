@@ -566,7 +566,7 @@ static bool FinishSection(ComponentRun& run, bool ran, bool skip_orig, ID3D12Res
     if (skip_orig || run.did > 0) return true;
     ++g_draw_stats.port_fellback_count;
     RestoreGameState(ctx);
-    ctx.mod_switched_off = PortApi::GetVarNs(run.ns.c_str(), L"mod_enabled", -1.f) == 0.f;
+    ctx.mod_switched_off = Mods().SampleCompSwitchedOff(dm, wc);
     return false;
 }
 

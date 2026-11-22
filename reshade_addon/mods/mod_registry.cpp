@@ -116,10 +116,7 @@ void ModRegistry::Build()
             }
             by_ns_[gm.wcl_ns] = mod_id;
             gm.ns_hash = NsHash(gm.wcl_ns.c_str());
-            if (gm.ns_hash) {
-                by_ns_hash_[gm.ns_hash] = mod_id;
-                gm.det_slot = PortApi::VarSlotNs(gm.wcl_ns.c_str(), L"object_detected");
-            }
+            if (gm.ns_hash) by_ns_hash_[gm.ns_hash] = mod_id;
             for (auto& c : units_[mod_id].mod.comps) {
                 MergedComp mc;
                 mc.mod_id = mod_id;
@@ -128,6 +125,23 @@ void ModRegistry::Build()
                 mc.match_count = c.match_index_count;
                 mc.remap_size = 0;
                 Comps().All().push_back(mc);
+                const std::wstring comp_fq = PortComponentSection(mod_id, c.index, c.tail, gm.wcl_ns);
+                if (!comp_fq.empty()) {
+                    PortApi::ComponentSectionVars cv;
+                    PortApi::InspectComponentSectionVars(comp_fq.c_str(), gm.wcl_ns.c_str(), &cv);
+                    if (!cv.pre_assigns.empty()) {
+                        for (const PortApi::SectionPreAssign& pa : cv.pre_assigns)
+                            if (std::find(gm.det_slots.begin(), gm.det_slots.end(), pa.slot) == gm.det_slots.end())
+                                gm.det_slots.push_back(pa.slot);
+                        gm.comp_det_assigns[c.index] = std::move(cv.pre_assigns);
+                    }
+                    if (!cv.enable_slots.empty()) {
+                        for (float* es : cv.enable_slots)
+                            if (std::find(gm.en_slots.begin(), gm.en_slots.end(), es) == gm.en_slots.end())
+                                gm.en_slots.push_back(es);
+                        gm.comp_en_slots[c.index] = std::move(cv.enable_slots);
+                    }
+                }
             }
             logger::write("WwmiGeom: geometry unit #%d ns='%ls' guid=%d '%ls' (%zu comps) fwdmap=%ls", mod_id,
                 units_[mod_id].wcl_ns.c_str(), units_[mod_id].mod.object_guid, units_[mod_id].mod.dir.c_str(),
@@ -226,6 +240,45 @@ void ModRegistry::EnsureModBuffersLoaded(int mod_id)
     const int n = WwmiMod::LoadResources(gm.mod, CurrentSet().held);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     logger::write("MODBUF-LOAD mod=%d ns='%ls': adopted %d buffer(s) lazily in %.1f ms", mod_id, gm.wcl_ns.c_str(), n, ms);
+}
+
+float ModRegistry::SampleDetected(int mod_id) const
+{
+    if (mod_id < 0 || mod_id >= (int)units_.size()) return -1.f;
+    const GeoMod& gm = units_[mod_id];
+    if (gm.det_slots.empty()) return -1.f;
+    float best = -1.f;
+    for (const float* slot : gm.det_slots) {
+        const float v = PortApi::GetVarSlot(slot, parse_gen_, -1.f);
+        if (v > best) best = v;
+    }
+    return best;
+}
+
+bool ModRegistry::SampleGeomEnabled(int mod_id) const
+{
+    if (mod_id < 0 || mod_id >= (int)units_.size()) return true;
+    const GeoMod& gm = units_[mod_id];
+    if (gm.en_slots.empty()) return true;
+    for (const float* slot : gm.en_slots) {
+        if (PortApi::GetVarSlot(slot, parse_gen_, 1.f) != 0.f) return true;
+    }
+    return false;
+}
+
+bool ModRegistry::SampleCompSwitchedOff(int mod_id, const WwmiMod::Component* wc) const
+{
+    if (mod_id < 0 || mod_id >= (int)units_.size()) return false;
+    const GeoMod& gm = units_[mod_id];
+    if (wc) {
+        auto it = gm.comp_en_slots.find(wc->index);
+        if (it != gm.comp_en_slots.end() && !it->second.empty()) {
+            for (const float* slot : it->second)
+                if (PortApi::GetVarSlot(slot, parse_gen_, 1.f) != 0.f) return false;
+            return true;
+        }
+    }
+    return !SampleGeomEnabled(mod_id);
 }
 
 std::vector<DiscoveredMod> ModRegistry::Discover()

@@ -392,8 +392,8 @@ void EngineFrame::PresentPasses(Frame& f, std::vector<ChainProf>& cp)
     bool newly_on_screen = false;
     for (int md = 0; md < (int)Mods().Count(); ++md) {
         GeoMod& gm = Mods().At(md);
-        gm.det_at_keys = gm.wcl_ns.empty() ? -1.f : PortApi::GetVarNs(gm.wcl_ns.c_str(), L"object_detected", -1.f);
-        const bool is_on = gm.det_at_keys > 0.f;
+        gm.det_at_keys = gm.wcl_ns.empty() ? -1.f : Mods().SampleDetected(md);
+        const bool is_on = gm.det_at_keys > 0.f || Mods().ClaimAge(md) <= 2u;
         on_screen |= is_on;
         const bool just_appeared = is_on && !gm.on_screen_prev;
         gm.on_screen_prev = is_on;
@@ -401,7 +401,7 @@ void EngineFrame::PresentPasses(Frame& f, std::vector<ChainProf>& cp)
         if (just_appeared && !gm.wcl_ns.empty()) g_mru_preload.NoteModOnScreen(gm.wcl_ns);
         if (is_on && !gm.buffers_loaded) Mods().EnsureModBuffersLoaded(md);
         const bool was = gm.geom_enabled;
-        gm.geom_enabled = gm.wcl_ns.empty() || PortApi::GetVarNs(gm.wcl_ns.c_str(), L"mod_enabled", 1.f) != 0.f;
+        gm.geom_enabled = gm.wcl_ns.empty() || Mods().SampleGeomEnabled(md);
         switched_on |= !was && gm.geom_enabled;
         if (was && !gm.geom_enabled) {
             g_tex_place.UnstampSwitchedOff(gm.wcl_ns.c_str());
@@ -410,8 +410,11 @@ void EngineFrame::PresentPasses(Frame& f, std::vector<ChainProf>& cp)
     }
     if (g_frame_id % 600u == 300u) g_tex_place.Report();
     if (newly_on_screen || switched_on || g_frame_id % 10u == 0u)
-        for (GeoMod& gm : Mods().Units())
-            if (gm.det_at_keys > 0.f) g_tex_place.SnapshotSelections(gm.wcl_ns.c_str());
+        for (int md = 0; md < (int)Mods().Count(); ++md) {
+            const GeoMod& gm = Mods().At(md);
+            if (gm.geom_enabled && (gm.det_at_keys > 0.f || Mods().ClaimAge(md) <= 2u))
+                g_tex_place.SnapshotSelections(gm.wcl_ns.c_str());
+        }
     if (switched_on) {
         g_tex_place.WatchSwitchedOn();
         g_tex_place.RetryMissed("a mod switched itself back on");
@@ -435,9 +438,10 @@ void EngineFrame::PresentPasses(Frame& f, std::vector<ChainProf>& cp)
     if (g_diag_arms.sectex_watch.load(std::memory_order_relaxed) > 0)
         g_diag_arms.sectex_watch.fetch_sub(1, std::memory_order_relaxed);
     bool post_switched_on = false;
-    for (GeoMod& gm : Mods().Units()) {
+    for (int md = 0; md < (int)Mods().Count(); ++md) {
+        GeoMod& gm = Mods().At(md);
         const bool was = gm.geom_enabled;
-        gm.geom_enabled = gm.wcl_ns.empty() || PortApi::GetVarNs(gm.wcl_ns.c_str(), L"mod_enabled", 1.f) != 0.f;
+        gm.geom_enabled = gm.wcl_ns.empty() || Mods().SampleGeomEnabled(md);
         post_switched_on |= !was && gm.geom_enabled;
         if (was && !gm.geom_enabled) {
             g_tex_place.UnstampSwitchedOff(gm.wcl_ns.c_str());

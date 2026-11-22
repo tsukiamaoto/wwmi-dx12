@@ -8,6 +8,7 @@
 #include "wwmi_mod.h" // WwmiMod::Mod -- GeoMod
 #include "../core/frame_clock.h" // FrameCounter -- GeoMod; g_frame_id -- ClaimAge
 #include "../core/ns_hash.h"
+#include "../migoto/port_api.h" // PortApi::SectionPreAssign
 
 // ONE LOADED CHARACTER MOD, shared by the hook modules.
 struct GeoMod {
@@ -15,10 +16,14 @@ struct GeoMod {
     std::wstring fwdmap;
     std::wstring wcl_ns; // THE mod key: their engine's namespace, from PortApi::NamespaceForIni
     uint64_t ns_hash = 0;
-    float* det_slot = nullptr;
+    // AST-derived from this mod's [TextureOverride] component sections (no hardcoded variable names):
+    std::unordered_map<int, std::vector<PortApi::SectionPreAssign>> comp_det_assigns; // comp_idx -> presence writes
+    std::unordered_map<int, std::vector<float*>> comp_en_slots; // comp_idx -> enable-gate vars
+    std::vector<float*> det_slots; // deduplicated union of comp_det_assigns slots
+    std::vector<float*> en_slots; // deduplicated union of comp_en_slots
     uint32_t last_char_frame = 0; // g_frame_id of the last claimed draw of this unit's character; 0 = never
-    float det_at_keys = 0.f; // $object_detected sampled at key-poll time, before [Present]'s post pass clears it
-    bool geom_enabled = true; // $mod_enabled sampled after [Present]'s post pass; what GeomEnabled answers
+    float det_at_keys = 0.f; // presence vars sampled at key-poll time, before [Present]'s post pass clears them
+    bool geom_enabled = true; // enable-gate vars sampled after [Present]'s post pass; what GeomEnabled answers
     bool buffers_loaded = false; // .buf mesh/shapekey resources adopted on first appearance instead of all 80+ mods at boot
     bool on_screen_prev = false; // det_at_keys > 0 on the previous frame (for instant frame-0 texture pre-enqueue)
     // this unit's share of the heartbeat's sect= / skip= / replaced=
@@ -53,6 +58,10 @@ public:
     uint32_t IndexEnd(int mod_id, uint32_t ib_hash) const;
     // WWMI enable-flag compliance: is this mod's geometry meant to be applied right now?
     bool GeomEnabled(int mod_id) const;
+    // Live sampling of AST-discovered presence and enable-gate variable slots.
+    float SampleDetected(int mod_id) const;
+    bool SampleGeomEnabled(int mod_id) const;
+    bool SampleCompSwitchedOff(int mod_id, const WwmiMod::Component* wc) const;
     uint32_t ClaimAge(int mod_id) const;
     bool OnScreen(int mod_id) const { return ClaimAge(mod_id) <= 4u; }
     // The geometry units discovered and described from their engine's parse, and the component table filled.

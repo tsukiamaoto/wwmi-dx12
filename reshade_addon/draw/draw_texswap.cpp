@@ -94,21 +94,26 @@ const ReadSlots& DrawReadSlots(reshade::api::command_list* cmd_list)
     return m.rs;
 }
 
-// A mod a claimed draw runs: detected (`$object_detected`) and its textures wanted now.
-static void NoteClaimedMod(int mod_id)
+// A mod a claimed draw runs: apply the component section's AST-discovered presence writes before texture selection.
+static void NoteClaimedMod(int mod_id, int comp_idx)
 {
     if (mod_id < 0 || mod_id >= (int)Mods().Count()) return;
     const GeoMod& gm = Mods().At(mod_id);
     if (gm.wcl_ns.empty()) return;
     PROF(PROF_TH_Detect);
     const unsigned gen = Mods().ParseGen();
-    if (gm.det_slot && !PortApi::VarSlotHolds(gm.det_slot, gen, 1.f)) {
+    auto it = gm.comp_det_assigns.find(comp_idx);
+    if (it != gm.comp_det_assigns.end() && !it->second.empty()) {
         std::optional<PortApi::EngineScope> det_scope;
-        {
-            PROF(PROF_TH_DetLock);
-            det_scope.emplace();
+        for (const PortApi::SectionPreAssign& pa : it->second) {
+            if (!pa.slot || PortApi::VarSlotHolds(pa.slot, gen, pa.value)) continue;
+            if (!det_scope) {
+                PROF(PROF_TH_DetLock);
+                det_scope.emplace();
+            }
+            if (!pa.guards.empty() && !PortApi::EvalVarGuards(pa.guards, gen)) continue;
+            PortApi::SetVarSlot(pa.slot, gen, pa.value);
         }
-        PortApi::SetVarSlot(gm.det_slot, gen, 1.f);
     }
     TexTiming::NoteClaimed(gm.wcl_ns.c_str());
 }
@@ -129,8 +134,8 @@ void StampClaimedTextures(DrawContext& ctx)
             own_ns = Mods().At(dc.mc->mod_id).wcl_ns.c_str();
             own_ns_hash = Mods().At(dc.mc->mod_id).ns_hash;
         }
-        NoteClaimedMod(dc.mc->mod_id);
-        for (const int s : dc.mc->with) NoteClaimedMod(Comps().At(s).mod_id);
+        NoteClaimedMod(dc.mc->mod_id, dc.mc->comp_idx);
+        for (const int s : dc.mc->with) NoteClaimedMod(Comps().At(s).mod_id, Comps().At(s).comp_idx);
         ProfScope _th_prep(PROF_TH_Prep);
         auto* dev = reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native());
         uint32_t inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);

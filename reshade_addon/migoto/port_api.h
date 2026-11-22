@@ -366,8 +366,22 @@ bool SetVar(const wchar_t* fq_name, float value);
 bool SetVarNs(const wchar_t* ns, const wchar_t* name, float value);
 // The variable's storage, for a caller that writes it often: valid until LoadGeneration() changes.
 float* VarSlotNs(const wchar_t* ns, const wchar_t* name);
+float GetVarSlot(const float* slot, unsigned gen, float def = -1.f);
 void SetVarSlot(float* slot, unsigned gen, float value);
 bool VarSlotHolds(const float* slot, unsigned gen, float value);
+
+// AST-derived per-component presence assignments and enable-gate variables (no hardcoded variable names).
+struct SectionPreAssign {
+    float* slot = nullptr;
+    float value = 1.f;
+    std::vector<const void*> guards; // pure CommandListEvaluatable* guards enclosing the assignment
+};
+struct ComponentSectionVars {
+    std::vector<SectionPreAssign> pre_assigns; // presence/detection flags assigned when this component draws
+    std::vector<float*> enable_slots; // own-namespace enable gates wrapping skip/draw inside this component
+};
+void InspectComponentSectionVars(const wchar_t* fq_section, const wchar_t* ns, ComponentSectionVars* out);
+bool EvalVarGuards(const std::vector<const void*>& guards, unsigned gen);
 
 void ForEachVariable(void (*cb)(const wchar_t* fq_name, float value, bool persist, void* user), void* user);
 void ForEachVariableSlot(void (*cb)(const wchar_t* fq_name, const float* slot, void* user), void* user);

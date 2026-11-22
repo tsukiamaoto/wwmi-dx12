@@ -123,6 +123,27 @@ float* VarSlotNs(const wchar_t* ns, const wchar_t* name)
     return it == command_list_globals.end() ? nullptr : &it->second.fval;
 }
 
+float GetVarSlot(const float* slot, unsigned gen, float def)
+{
+    if (!g_loaded || !slot) return def;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    return gen == g_generation ? *slot : def;
+}
+
+bool EvalVarGuards(const std::vector<const void*>& guards, unsigned gen)
+{
+    if (guards.empty()) return true;
+    if (!g_loaded) return false;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (gen != g_generation) return false;
+    for (const void* g : guards) {
+        auto* e = static_cast<CommandListEvaluatable*>(const_cast<void*>(g));
+        float v = 0.f;
+        if (!e || !e->static_evaluate(&v, nullptr, true) || v == 0.f) return false;
+    }
+    return true;
+}
+
 void SetVarSlot(float* slot, unsigned gen, float value)
 {
     if (!g_loaded || !slot) return;

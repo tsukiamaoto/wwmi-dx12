@@ -726,4 +726,238 @@ void ForEachVarTextureOverride(void (*cb)(uint32_t, const wchar_t*, void*), void
 {
     ForEachSafeTextureOverride(cb, user, false);
 }
+
+namespace {
+
+std::wstring LowerNormNs(const std::wstring& s)
+{
+    std::wstring r = s;
+    for (wchar_t& c : r) {
+        if (c == L'/') c = L'\\';
+        c = (wchar_t)towlower(c);
+    }
+    return r;
+}
+
+std::wstring NsOfSectionFq(const std::wstring& sec)
+{
+    const size_t a = sec.find(L'\\');
+    const size_t b = sec.rfind(L'\\');
+    if (a == std::wstring::npos || b == std::wstring::npos || b <= a + 1) return {};
+    return LowerNormNs(sec.substr(a + 1, b - a - 1));
+}
+
+bool PureVarExpr(const CommandListEvaluatable* e)
+{
+    if (!e) return false;
+    if (const auto* o = dynamic_cast<const CommandListOperand*>(e))
+        return o->type == ParamOverrideType::VALUE || (o->type == ParamOverrideType::VARIABLE && o->var_ftarget);
+    if (const auto* op = dynamic_cast<const CommandListOperator*>(e))
+        return (!op->lhs || PureVarExpr(op->lhs.get())) && (!op->rhs || PureVarExpr(op->rhs.get()));
+    return false;
+}
+
+bool ListHasSkipOrDraw(const CommandList* cl, std::vector<const void*>& seen)
+{
+    if (!cl) return false;
+    for (const auto& c : cl->commands) {
+        CommandListCommand* cmd = MigotoPort::g_command_observer.Unwrap(c.get());
+        if (dynamic_cast<SkipCommand*>(cmd) || dynamic_cast<DrawCommand*>(cmd)) return true;
+        if (auto* ic = dynamic_cast<IfCommand*>(cmd)) {
+            if (ListHasSkipOrDraw(ic->true_commands_pre.get(), seen) ||
+                ListHasSkipOrDraw(ic->false_commands_pre.get(), seen))
+                return true;
+        } else if (auto* re = dynamic_cast<RunExplicitCommandList*>(cmd)) {
+            ExplicitCommandListSection* s = re->command_list_section;
+            if (!s || std::find(seen.begin(), seen.end(), (const void*)s) != seen.end()) continue;
+            seen.push_back(s);
+            if (ListHasSkipOrDraw(&s->command_list, seen)) return true;
+        }
+    }
+    return false;
+}
+
+void CollectListWrites(const CommandList* cl, std::unordered_set<const float*>& written,
+    std::unordered_set<const float*>* zeroed, std::vector<const void*>& seen)
+{
+    if (!cl) return;
+    for (const auto& c : cl->commands) {
+        CommandListCommand* cmd = MigotoPort::g_command_observer.Unwrap(c.get());
+        if (auto* va = dynamic_cast<VariableAssignment*>(cmd)) {
+            if (va->var) {
+                const float* slot = &va->var->fval;
+                written.insert(slot);
+                if (zeroed) {
+                    float v = 0.f;
+                    if (va->expression.static_evaluate(&v, nullptr, false) && v == 0.f) zeroed->insert(slot);
+                }
+            }
+        } else if (auto* ic = dynamic_cast<IfCommand*>(cmd)) {
+            CollectListWrites(ic->true_commands_pre.get(), written, zeroed, seen);
+            CollectListWrites(ic->true_commands_post.get(), written, zeroed, seen);
+            CollectListWrites(ic->false_commands_pre.get(), written, zeroed, seen);
+            CollectListWrites(ic->false_commands_post.get(), written, zeroed, seen);
+        } else if (auto* re = dynamic_cast<RunExplicitCommandList*>(cmd)) {
+            ExplicitCommandListSection* s = re->command_list_section;
+            if (!s || std::find(seen.begin(), seen.end(), (const void*)s) != seen.end()) continue;
+            seen.push_back(s);
+            CollectListWrites(&s->command_list, written, zeroed, seen);
+            CollectListWrites(&s->post_command_list, written, zeroed, seen);
+        }
+    }
+}
+
+struct AstVarCache {
+    unsigned gen = ~0u;
+    std::unordered_set<const float*> present_vars;
+    std::unordered_set<const float*> tex_rule_vars;
+    std::unordered_map<const float*, std::wstring> var_ns;
+    std::unordered_map<std::wstring, std::vector<const float*>> ns_enable_slots;
+
+    bool IsOwnNs(const float* slot, const std::wstring& ns_lower) const
+    {
+        if (!slot || ns_lower.empty()) return false;
+        auto it = var_ns.find(slot);
+        return it != var_ns.end() && it->second == ns_lower;
+    }
+
+    void InspectList(const CommandList* cl, const std::wstring& ns_lower,
+        const std::unordered_set<const float*>& written_in_sec, const std::unordered_set<const float*>& zeroed_in_sec,
+        std::vector<const void*>& guards, std::vector<const void*>& seen, ComponentSectionVars* out) const
+    {
+        if (!cl) return;
+        for (const auto& c : cl->commands) {
+            CommandListCommand* cmd = MigotoPort::g_command_observer.Unwrap(c.get());
+            if (auto* va = dynamic_cast<VariableAssignment*>(cmd)) {
+                if (!va->var || (va->var->flags & VariableFlags::PERSIST)) continue;
+                float val = 0.f;
+                if (!va->expression.static_evaluate(&val, nullptr, false) || val == 0.f) continue;
+                float* slot = &va->var->fval;
+                if (zeroed_in_sec.count(slot)) continue; // per-draw scratch pass flag (set & cleared in same section)
+                const bool own = IsOwnNs(slot, ns_lower);
+                const bool in_tex = tex_rule_vars.count(slot) != 0;
+                const bool in_pres = present_vars.count(slot) != 0;
+                if ((own && (in_tex || in_pres)) || in_tex) {
+                    const bool dup = std::any_of(out->pre_assigns.begin(), out->pre_assigns.end(),
+                        [slot](const SectionPreAssign& p) { return p.slot == slot; });
+                    if (!dup) out->pre_assigns.push_back({ slot, val, guards });
+                }
+            } else if (auto* ic = dynamic_cast<IfCommand*>(cmd)) {
+                CommandListEvaluatable* ev = ic->expression.evaluatable.get();
+                if (!ev || !PureVarExpr(ev)) continue;
+                if (const auto* o = dynamic_cast<const CommandListOperand*>(ev)) {
+                    if (o->type == ParamOverrideType::VARIABLE && o->var_ftarget &&
+                        IsOwnNs(o->var_ftarget, ns_lower) && !written_in_sec.count(o->var_ftarget)) {
+                        std::vector<const void*> skip_seen;
+                        if (ListHasSkipOrDraw(ic->true_commands_pre.get(), skip_seen)) {
+                            if (std::find(out->enable_slots.begin(), out->enable_slots.end(), o->var_ftarget) ==
+                                out->enable_slots.end())
+                                out->enable_slots.push_back(o->var_ftarget);
+                        }
+                    }
+                }
+                guards.push_back(ev);
+                InspectList(ic->true_commands_pre.get(), ns_lower, written_in_sec, zeroed_in_sec, guards, seen, out);
+                guards.pop_back();
+            } else if (auto* re = dynamic_cast<RunExplicitCommandList*>(cmd)) {
+                ExplicitCommandListSection* s = re->command_list_section;
+                if (!s || std::find(seen.begin(), seen.end(), (const void*)s) != seen.end()) continue;
+                seen.push_back(s);
+                InspectList(&s->command_list, ns_lower, written_in_sec, zeroed_in_sec, guards, seen, out);
+            }
+        }
+    }
+
+    void InspectOverride(TextureOverride* to, const std::wstring& ns_lower, ComponentSectionVars* out) const
+    {
+        if (!to || !out) return;
+        std::unordered_set<const float*> written_in_sec;
+        std::unordered_set<const float*> zeroed_in_sec;
+        std::vector<const void*> wseen;
+        CollectListWrites(&to->command_list, written_in_sec, &zeroed_in_sec, wseen);
+        CollectListWrites(&to->post_command_list, written_in_sec, &zeroed_in_sec, wseen);
+        std::vector<const void*> guards;
+        std::vector<const void*> seen;
+        InspectList(&to->command_list, ns_lower, written_in_sec, zeroed_in_sec, guards, seen, out);
+    }
+
+    void EnsureLocked()
+    {
+        if (gen == g_generation) return;
+        gen = g_generation;
+        present_vars.clear();
+        tex_rule_vars.clear();
+        var_ns.clear();
+        ns_enable_slots.clear();
+
+        {
+            std::vector<const void*> seen;
+            CollectListWrites(&G->present_command_list, present_vars, nullptr, seen);
+            CollectListWrites(&G->post_present_command_list, present_vars, nullptr, seen);
+        }
+        for (const auto& kv : command_list_globals) {
+            const std::wstring& k = kv.first; // $\<ns>\<local>
+            if (k.size() > 3 && k[0] == L'$' && k[1] == L'\\') {
+                const size_t last = k.rfind(L'\\');
+                if (last != std::wstring::npos && last > 2) var_ns.emplace(&kv.second.fval, LowerNormNs(k.substr(2, last - 2)));
+            }
+        }
+        for (auto& kv : G->mTextureOverrideMap) {
+            for (TextureOverride& to : kv.second) {
+                if (to.match_first_index.op != FuzzyMatchOp::ALWAYS || !TextureOverrideAssignsThis(&to)) continue;
+                std::vector<const float*> vars;
+                TextureOverrideReadVars(&to, vars);
+                for (const float* v : vars) tex_rule_vars.insert(v);
+            }
+        }
+        for (auto& kv : G->mTextureOverrideMap) {
+            for (TextureOverride& to : kv.second) {
+                if (to.match_first_index.op == FuzzyMatchOp::ALWAYS) continue; // ranged component sections only
+                const std::wstring ns = NsOfSectionFq(to.ini_section);
+                if (ns.empty()) continue;
+                ComponentSectionVars tmp;
+                InspectOverride(&to, ns, &tmp);
+                auto& dst = ns_enable_slots[ns];
+                for (float* es : tmp.enable_slots)
+                    if (std::find(dst.begin(), dst.end(), es) == dst.end()) dst.push_back(es);
+            }
+        }
+    }
+};
+
+AstVarCache& GetAstVarCache()
+{
+    static auto* c = new AstVarCache();
+    return *c;
+}
+
+} // namespace
+
+void InspectComponentSectionVars(const wchar_t* fq_section, const wchar_t* ns, ComponentSectionVars* out)
+{
+    if (!out) return;
+    out->pre_assigns.clear();
+    out->enable_slots.clear();
+    if (!g_loaded || !fq_section || !*fq_section || !ns || !*ns) return;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded) return;
+    AstVarCache& cache = GetAstVarCache();
+    cache.EnsureLocked();
+    auto it = SectionIndex().find(fq_section);
+    if (it == SectionIndex().end() || !it->second) return;
+    cache.InspectOverride(it->second, LowerNormNs(ns), out);
+}
+
+void CollectNamespaceEnableSlots(const std::wstring& ns_lower, std::vector<const float*>& out)
+{
+    out.clear();
+    if (!g_loaded || ns_lower.empty()) return;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded) return;
+    AstVarCache& cache = GetAstVarCache();
+    cache.EnsureLocked();
+    auto it = cache.ns_enable_slots.find(ns_lower);
+    if (it != cache.ns_enable_slots.end()) out = it->second;
+}
+
 } // namespace PortApi

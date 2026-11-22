@@ -818,7 +818,7 @@ bool SelectsResource(TextureOverride* to)
 
 bool ModSwitchedOff(const TextureOverride* to)
 {
-    static std::unordered_map<const TextureOverride*, const float*> s_switch;
+    static std::unordered_map<const TextureOverride*, std::vector<const float*>> s_switch;
     static unsigned s_gen = ~0u;
     const unsigned gen = LoadGeneration();
     if (gen != s_gen) {
@@ -827,20 +827,25 @@ bool ModSwitchedOff(const TextureOverride* to)
     }
     auto it = s_switch.find(to);
     if (it == s_switch.end()) {
-        const float* v = nullptr;
+        std::vector<const float*> vars;
         const std::wstring& sec = to->ini_section; // TextureOverride\<namespace>\<name>
         const size_t a = sec.find(L'\\');
         const size_t b = sec.rfind(L'\\');
         if (a != std::wstring::npos && b != std::wstring::npos && b > a) {
-            std::wstring key = L"$\\" + sec.substr(a + 1, b - a - 1) + L"\\mod_enabled";
-            for (auto& ch : key) ch = (wchar_t)towlower(ch);
-            auto vi = command_list_globals.find(key);
-            if (vi != command_list_globals.end()) v = &vi->second.fval;
+            std::wstring ns = sec.substr(a + 1, b - a - 1);
+            for (auto& ch : ns) {
+                if (ch == L'/') ch = L'\\';
+                ch = (wchar_t)towlower(ch);
+            }
+            CollectNamespaceEnableSlots(ns, vars);
         }
-        if (v) MigotoPort::g_selection_watch.WatchVar(v);
-        it = s_switch.emplace(to, v).first;
+        for (const float* v : vars) MigotoPort::g_selection_watch.WatchVar(v);
+        it = s_switch.emplace(to, std::move(vars)).first;
     }
-    return it->second && *it->second == 0.f;
+    if (it->second.empty()) return false;
+    for (const float* v : it->second)
+        if (*v != 0.f) return false;
+    return true;
 }
 
 bool PureExpr(const CommandListEvaluatable* e, std::vector<const float*>& vars)

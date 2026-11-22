@@ -32,6 +32,7 @@ bool TextureOverrideHashKnown(uint32_t h); // true before the first parse: unkno
 std::unordered_map<std::wstring, TextureOverride*>& SectionIndex();
 bool TextureOverrideAssignsThis(TextureOverride* to);
 void TextureOverrideReadVars(TextureOverride* to, std::vector<const float*>& vars);
+void CollectNamespaceEnableSlots(const std::wstring& ns_lower, std::vector<const float*>& out);
 std::unordered_map<std::wstring, ExplicitCommandListSection*>& ExplicitIndex();
 std::unordered_map<const void*, std::wstring>& ExplicitNameIndex();
 std::unordered_map<const void*, std::wstring>& CustomResourceNameIndex();
