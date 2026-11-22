@@ -26,6 +26,7 @@
 #include "frame_sync.h"
 #include "present_toggles.h"
 #include "../textures/tex_place.h"
+#include "../textures/mru_preload.h"
 #include "../textures/tex_slot_log.h"
 #include "../migoto/dx12_pipeline.h"
 #include "../migoto/port_api.h"
@@ -380,13 +381,25 @@ void EngineFrame::PresentPasses(Frame& f, std::vector<ChainProf>& cp)
 #ifdef WWMI_DEBUG
     if (g_tex_trace.Armed()) g_tex_trace.Line("present: the [Present] pre pass runs");
 #endif
+    // Adopt .buf resources lazily for any character mod that just appeared, before PresentPre runs its compute chains
+    // and before SubmitList flushes uploads onto the present command list (ahead of next frame's draw lists).
+    for (int md = 0; md < (int)Mods().Count(); ++md)
+        if (!Mods().At(md).buffers_loaded && Mods().ClaimAge(md) <= 2u) Mods().EnsureModBuffersLoaded(md);
     PortApi::PresentPre(); // their [Present] pre pass
     if (f.focused) PortApi::TickInput();
     bool on_screen = false;
     bool switched_on = false;
-    for (GeoMod& gm : Mods().Units()) {
+    bool newly_on_screen = false;
+    for (int md = 0; md < (int)Mods().Count(); ++md) {
+        GeoMod& gm = Mods().At(md);
         gm.det_at_keys = gm.wcl_ns.empty() ? -1.f : PortApi::GetVarNs(gm.wcl_ns.c_str(), L"object_detected", -1.f);
-        on_screen |= gm.det_at_keys > 0.f;
+        const bool is_on = gm.det_at_keys > 0.f;
+        on_screen |= is_on;
+        const bool just_appeared = is_on && !gm.on_screen_prev;
+        gm.on_screen_prev = is_on;
+        newly_on_screen |= just_appeared;
+        if (just_appeared && !gm.wcl_ns.empty()) g_mru_preload.NoteModOnScreen(gm.wcl_ns);
+        if (is_on && !gm.buffers_loaded) Mods().EnsureModBuffersLoaded(md);
         const bool was = gm.geom_enabled;
         gm.geom_enabled = gm.wcl_ns.empty() || PortApi::GetVarNs(gm.wcl_ns.c_str(), L"mod_enabled", 1.f) != 0.f;
         switched_on |= !was && gm.geom_enabled;
@@ -396,7 +409,7 @@ void EngineFrame::PresentPasses(Frame& f, std::vector<ChainProf>& cp)
         }
     }
     if (g_frame_id % 600u == 300u) g_tex_place.Report();
-    if (switched_on || g_frame_id % 10u == 0u)
+    if (newly_on_screen || switched_on || g_frame_id % 10u == 0u)
         for (GeoMod& gm : Mods().Units())
             if (gm.det_at_keys > 0.f) g_tex_place.SnapshotSelections(gm.wcl_ns.c_str());
     if (switched_on) {

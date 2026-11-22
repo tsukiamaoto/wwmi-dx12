@@ -1,6 +1,8 @@
 #include "tex_defer.h"
+#include "mru_preload.h"
 #include "../instrumentation/diag_gate.h"
 #include "../addon/settings.h"
+#include "../migoto/dx12_pipeline.h"
 #include "../mods/character_recognition.h"
 #include "../core/log.h"
 #include <windows.h>
@@ -83,7 +85,14 @@ bool TexDefer::Offer(const PortApi::DeferredTexture& t, void* user)
             if (back->second.gen == gen) job.tex.maxsize = back->second.maxsize;
             self->returns_.erase(back);
         }
-        self->queue_.push_back(std::move(job));
+        if (job.tex.low_priority) {
+            self->queue_.push_back(std::move(job));
+        } else {
+            // Live on-screen requests cut ahead of background preload jobs while preserving FIFO order among themselves.
+            auto pos = std::find_if(
+                self->queue_.begin(), self->queue_.end(), [](const Job& j) { return j.tex.low_priority; });
+            self->queue_.insert(pos, std::move(job));
+        }
         if (self->threads_.empty()) {
             const unsigned hw = std::thread::hardware_concurrency();
             const unsigned n_workers = (std::clamp)(hw ? hw / 2u : 2u, 2u, 4u);
@@ -92,7 +101,98 @@ bool TexDefer::Offer(const PortApi::DeferredTexture& t, void* user)
         }
     }
     self->cv_.notify_one();
+    if (!t.low_priority) g_mru_preload.NoteLiveTexture(t.fq_name);
     return true;
+}
+
+void TexDefer::CompleteJobLocked(int mod, unsigned gen, unsigned made, unsigned stale, unsigned smaller,
+    long long load_ticks, long long locked, BurstStats* out_done, bool* out_log)
+{
+    if (mod >= 0 && gen == gen_.load(std::memory_order_relaxed)) Slot(mod).fetch_sub(1, std::memory_order_acq_rel);
+    const unsigned remaining = in_flight_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    burst_.made += made;
+    burst_.stale += stale;
+    burst_.smaller += smaller;
+    burst_.locked += locked;
+    if (load_ticks > burst_.longest) burst_.longest = load_ticks;
+    if (remaining == 0 && queue_.empty() && ready_.empty() && burst_.active) {
+        *out_done = std::move(burst_);
+        burst_ = BurstStats{};
+        *out_log = true;
+    }
+}
+
+void TexDefer::LogBurst(const BurstStats& done_stats, long long freq)
+{
+    if (done_stats.namespaces.empty() || freq <= 0) return;
+    LARGE_INTEGER t1{};
+    QueryPerformanceCounter(&t1);
+    const double ms = 1000.0 / (double)freq;
+    logger::write(
+        "TEXDEFER '%ls'%s: loaded %u of %u texture(s), %u of them asked for at the size they were let go at, "
+        "in %.0f ms, %.0f ms of it under the engine lock (longest texture %.0f ms)%s",
+        done_stats.namespaces.front().c_str(), done_stats.namespaces.size() > 1 ? " and others" : "",
+        done_stats.made, done_stats.total, done_stats.smaller, (double)(t1.QuadPart - done_stats.t0) * ms,
+        (double)done_stats.locked * ms, (double)done_stats.longest * ms,
+        done_stats.stale ? " -- some were asked for before the inis were reloaded, not loaded" : "");
+}
+
+void TexDefer::PublishCompleted()
+{
+    std::vector<ReadyItem> due;
+    {
+        std::lock_guard l(mtx_);
+        if (ready_.empty()) return;
+        const unsigned live_gen = PortApi::LoadGeneration();
+        std::deque<ReadyItem> keep;
+        for (ReadyItem& it : ready_) {
+            if (stop_ || it.gen != live_gen || MigotoPort::AsyncCopyPassed(it.copy_fence))
+                due.push_back(std::move(it));
+            else
+                keep.push_back(std::move(it));
+        }
+        ready_.swap(keep);
+    }
+    if (due.empty()) return;
+
+    LARGE_INTEGER freq{};
+    QueryPerformanceFrequency(&freq);
+    for (ReadyItem& it : due) {
+        unsigned made = 0;
+        unsigned stale = 0;
+        unsigned smaller = 0;
+        LONGLONG locked = 0;
+        if (PortApi::LoadGeneration() != it.gen) {
+            stale = 1;
+            if (it.res) it.res->Release();
+        } else if (it.res) {
+            LARGE_INTEGER b{};
+            LARGE_INTEGER c{};
+            QueryPerformanceCounter(&b);
+            bool stopping = false;
+            {
+                std::lock_guard l(mtx_);
+                stopping = stop_;
+            }
+            if (!stopping && PortApi::PublishDeferredTexture(it.fq_name.c_str(), it.res)) {
+                made = 1;
+                if (it.maxsize) smaller = 1;
+            } else {
+                it.res->Release();
+            }
+            QueryPerformanceCounter(&c);
+            locked = c.QuadPart - b.QuadPart;
+        }
+        if (made) loaded_.fetch_add(made, std::memory_order_acq_rel);
+
+        BurstStats done_stats{};
+        bool log_burst = false;
+        {
+            std::lock_guard l(mtx_);
+            CompleteJobLocked(it.mod, it.gen, made, stale, smaller, it.load_ticks, locked, &done_stats, &log_burst);
+        }
+        if (log_burst) LogBurst(done_stats, freq.QuadPart);
+    }
 }
 
 void TexDefer::Run()
@@ -132,8 +232,25 @@ void TexDefer::Run()
             LARGE_INTEGER b{};
             LARGE_INTEGER c{};
             QueryPerformanceCounter(&a);
-            ID3D11Resource* res = PortApi::LoadDeferredTexture(job.tex);
+            uint64_t copy_fv = 0;
+            ID3D11Resource* res = PortApi::LoadDeferredTexture(job.tex, /*async_copy=*/true, &copy_fv);
             QueryPerformanceCounter(&b);
+            load_ticks = b.QuadPart - a.QuadPart;
+            if (res && copy_fv != 0 && !MigotoPort::AsyncCopyPassed(copy_fv)) {
+                // Async COPY-queue DMA is still in flight: hand off to Present-thread PublishCompleted() so this
+                // worker immediately grabs the next DDS file without waiting for the GPU fence.
+                bool handoff = false;
+                {
+                    std::lock_guard l(mtx_);
+                    if (!stop_) {
+                        ready_.push_back({ job.tex.fq_name, res, copy_fv, job.mod, job.gen, job.tex.maxsize, load_ticks });
+                        handoff = true;
+                    }
+                }
+                if (handoff) continue;
+                res->Release();
+                res = nullptr;
+            }
             if (res) {
                 bool stopping = false;
                 {
@@ -148,7 +265,6 @@ void TexDefer::Run()
                 }
             }
             QueryPerformanceCounter(&c);
-            load_ticks = b.QuadPart - a.QuadPart;
             locked = c.QuadPart - b.QuadPart;
         }
         if (made) loaded_.fetch_add(made, std::memory_order_acq_rel);
@@ -157,32 +273,9 @@ void TexDefer::Run()
         bool log_burst = false;
         {
             std::lock_guard l(mtx_);
-            if (job.mod >= 0 && job.gen == gen_.load(std::memory_order_relaxed))
-                Slot(job.mod).fetch_sub(1, std::memory_order_acq_rel);
-            const unsigned remaining = in_flight_.fetch_sub(1, std::memory_order_acq_rel) - 1;
-            burst_.made += made;
-            burst_.stale += stale;
-            burst_.smaller += smaller;
-            burst_.locked += locked;
-            if (load_ticks > burst_.longest) burst_.longest = load_ticks;
-            if (remaining == 0 && queue_.empty() && burst_.active) {
-                done_stats = std::move(burst_);
-                burst_ = BurstStats{};
-                log_burst = true;
-            }
+            CompleteJobLocked(job.mod, job.gen, made, stale, smaller, load_ticks, locked, &done_stats, &log_burst);
         }
-        if (log_burst && !done_stats.namespaces.empty()) {
-            LARGE_INTEGER t1{};
-            QueryPerformanceCounter(&t1);
-            const double ms = 1000.0 / (double)freq.QuadPart;
-            logger::write(
-                "TEXDEFER '%ls'%s: loaded %u of %u texture(s), %u of them asked for at the size they were let go at, "
-                "in %.0f ms, %.0f ms of it under the engine lock (longest texture %.0f ms)%s",
-                done_stats.namespaces.front().c_str(), done_stats.namespaces.size() > 1 ? " and others" : "",
-                done_stats.made, done_stats.total, done_stats.smaller, (double)(t1.QuadPart - done_stats.t0) * ms,
-                (double)done_stats.locked * ms, (double)done_stats.longest * ms,
-                done_stats.stale ? " -- some were asked for before the inis were reloaded, not loaded" : "");
-        }
+        if (log_burst) LogBurst(done_stats, freq.QuadPart);
     }
 }
 
@@ -205,4 +298,13 @@ void TexDefer::Stop()
     cv_.notify_all();
     for (std::thread& t : to_join)
         if (t.joinable()) t.join();
+    MigotoPort::AsyncCopyShutdown();
+    std::deque<ReadyItem> leftover;
+    {
+        std::lock_guard l(mtx_);
+        leftover.swap(ready_);
+    }
+    for (ReadyItem& it : leftover)
+        if (it.res) it.res->Release();
+    in_flight_.store(0, std::memory_order_release);
 }

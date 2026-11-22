@@ -19,6 +19,8 @@ struct GeoMod {
     uint32_t last_char_frame = 0; // g_frame_id of the last claimed draw of this unit's character; 0 = never
     float det_at_keys = 0.f; // $object_detected sampled at key-poll time, before [Present]'s post pass clears it
     bool geom_enabled = true; // $mod_enabled sampled after [Present]'s post pass; what GeomEnabled answers
+    bool buffers_loaded = false; // .buf mesh/shapekey resources adopted on first appearance instead of all 80+ mods at boot
+    bool on_screen_prev = false; // det_at_keys > 0 on the previous frame (for instant frame-0 texture pre-enqueue)
     // this unit's share of the heartbeat's sect= / skip= / replaced=
     FrameCounter sect_runs;
     FrameCounter skip_orig;
@@ -55,6 +57,8 @@ public:
     bool OnScreen(int mod_id) const { return ClaimAge(mod_id) <= 4u; }
     // The geometry units discovered and described from their engine's parse, and the component table filled.
     void Build();
+    // Adopt this unit's .buf resources from 3DMigoto on first appearance (Present thread, before PresentPre / Flush).
+    void EnsureModBuffersLoaded(int mod_id);
     static std::vector<DiscoveredMod> Discover();
     int DiscoveredCount() const { return discovered_; }
 

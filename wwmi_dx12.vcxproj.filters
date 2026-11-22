@@ -265,6 +265,9 @@
     <ClCompile Include="reshade_addon\textures\tex_defer.cpp">
       <Filter>textures</Filter>
     </ClCompile>
+    <ClCompile Include="reshade_addon\textures\mru_preload.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
     <ClCompile Include="reshade_addon\textures\tex_replace.cpp">
       <Filter>textures</Filter>
     </ClCompile>

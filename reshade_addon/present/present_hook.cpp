@@ -27,6 +27,7 @@
 #include "../textures/tex_replace.h"
 #include "../textures/tex_budget.h"
 #include "../textures/tex_encode.h"
+#include "../textures/mru_preload.h"
 #include "../instrumentation/crash_handler.h"
 #include "../shapekeys/shapekey_chain.h"
 #include "../instrumentation/debug_pipe.h"
@@ -212,6 +213,7 @@ void FrameStepper::Step(command_queue* queue, swapchain* sc, bool at_present)
         : (ID3D12CommandQueue*)queue->get_native();
     g_tex_replace.Tick(work_q);
     g_tex_budget.Tick();
+    g_mru_preload.Tick();
     g_tex_encode_test.Tick(work_q);
     g_tex_encoder.Tick();
     if (g_draw_toggles.wwmi_geom) {

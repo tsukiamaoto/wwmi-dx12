@@ -19,6 +19,11 @@
 #include "../core/d3d12_buffer.h"
 #include "../core/dxgi_bc.h"
 #include "../core/buffer_view_fit.h"
+#include <wrl/client.h>
+#include <wincodec.h>
+#include <memory>
+#include "PlatformHelpers.h"
+#include "LoaderHelpers.h"
 
 namespace MigotoPort {
 
@@ -780,6 +785,260 @@ void STDMETHODCALLTYPE Dx12Device::GetImmediateContext(ID3D11DeviceContext** pp)
 void STDMETHODCALLTYPE Dx12Device::GetImmediateContext1(ID3D11DeviceContext1** pp)
 {
     if (pp) *pp = Context();
+}
+
+namespace {
+
+bool ReadExactFile(HANDLE hFile, void* dst, uint64_t bytes)
+{
+    uint8_t* p = static_cast<uint8_t*>(dst);
+    uint64_t left = bytes;
+    while (left > 0) {
+        const DWORD chunk = left > 0x40000000ull ? 0x40000000u : static_cast<DWORD>(left);
+        DWORD got = 0;
+        if (!ReadFile(hFile, p, chunk, &got, nullptr) || got == 0) return false;
+        p += got;
+        left -= got;
+    }
+    return true;
+}
+
+} // namespace
+
+ID3D11Resource* TryLoadDdsDirectToUpload(const wchar_t* filename, size_t maxsize, UINT bind_flags, UINT misc_flags,
+    bool force_srgb, bool async_copy, uint64_t* out_async_fence)
+{
+    if (out_async_fence) *out_async_fence = 0;
+    if (!filename || !*filename || NoTextures()) return nullptr;
+    {
+        static const bool skip = [] {
+            char b[8] = {};
+            size_t n = 0;
+            return getenv_s(&n, b, sizeof(b), "PORT_NO_TEXUP") == 0 && n && b[0] == '1';
+        }();
+        if (skip) return nullptr;
+    }
+    const Dx12Bridge& b = GetDx12Bridge();
+    if (!b.device) return nullptr;
+
+    HANDLE hFile = CreateFileW(
+        filename, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return nullptr;
+    struct FileClose {
+        HANDLE h;
+        ~FileClose()
+        {
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        }
+    } closer{ hFile };
+
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart < (LONGLONG)(sizeof(uint32_t) + sizeof(DirectX::DDS_HEADER)))
+        return nullptr;
+
+    uint32_t magic = 0;
+    DirectX::DDS_HEADER hdr{};
+    if (!ReadExactFile(hFile, &magic, sizeof(magic)) || !ReadExactFile(hFile, &hdr, sizeof(hdr))) return nullptr;
+    if (magic != DirectX::DDS_MAGIC || hdr.size != sizeof(DirectX::DDS_HEADER) ||
+        hdr.ddspf.size != sizeof(DirectX::DDS_PIXELFORMAT))
+        return nullptr;
+
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    uint64_t dataOffset = sizeof(uint32_t) + sizeof(DirectX::DDS_HEADER);
+    if ((hdr.ddspf.flags & DDS_FOURCC) && hdr.ddspf.fourCC == MAKEFOURCC('D', 'X', '1', '0')) {
+        if ((uint64_t)fileSize.QuadPart < dataOffset + sizeof(DirectX::DDS_HEADER_DXT10)) return nullptr;
+        DirectX::DDS_HEADER_DXT10 d10{};
+        if (!ReadExactFile(hFile, &d10, sizeof(d10))) return nullptr;
+        dataOffset += sizeof(DirectX::DDS_HEADER_DXT10);
+        if (d10.resourceDimension != DirectX::DDS_DIMENSION_TEXTURE2D || d10.arraySize != 1) return nullptr;
+        if (d10.miscFlag & D3D11_RESOURCE_MISC_TEXTURECUBE) return nullptr;
+        switch (d10.dxgiFormat) {
+        case DXGI_FORMAT_AI44:
+        case DXGI_FORMAT_IA44:
+        case DXGI_FORMAT_P8:
+        case DXGI_FORMAT_A8P8: return nullptr;
+        default:
+            if (DirectX::LoaderHelpers::BitsPerPixel(d10.dxgiFormat) == 0) return nullptr;
+        }
+        format = d10.dxgiFormat;
+    } else {
+        if (hdr.flags & DDS_HEADER_FLAGS_VOLUME) return nullptr;
+        if (hdr.caps2 & DDS_CUBEMAP) return nullptr;
+        format = DirectX::LoaderHelpers::GetDXGIFormat(hdr.ddspf);
+        if (format == DXGI_FORMAT_UNKNOWN) return nullptr;
+    }
+
+    if (force_srgb) format = DirectX::LoaderHelpers::MakeSRGB(format);
+
+    const UINT mipCount = hdr.mipMapCount ? hdr.mipMapCount : 1u;
+    const UINT width = hdr.width;
+    const UINT height = hdr.height;
+    if (!width || !height || width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || mipCount > D3D11_REQ_MIP_LEVELS)
+        return nullptr;
+
+    struct MipInfo {
+        size_t numBytes = 0;
+        size_t rowBytes = 0;
+        size_t numRows = 0;
+    };
+    std::vector<MipInfo> kept;
+    kept.reserve(mipCount);
+    UINT twidth = 0;
+    UINT theight = 0;
+    uint64_t skipBytes = 0;
+    uint64_t totalSrcBytes = 0;
+    {
+        size_t w = width;
+        size_t h = height;
+        for (UINT i = 0; i < mipCount; ++i) {
+            size_t numBytes = 0;
+            size_t rowBytes = 0;
+            size_t numRows = 0;
+            DirectX::LoaderHelpers::GetSurfaceInfo(w, h, format, &numBytes, &rowBytes, &numRows);
+            if (!numBytes || !rowBytes || !numRows) return nullptr;
+            totalSrcBytes += numBytes;
+            if ((mipCount <= 1u) || !maxsize || (w <= maxsize && h <= maxsize)) {
+                if (!twidth) {
+                    twidth = (UINT)w;
+                    theight = (UINT)h;
+                }
+                kept.push_back({ numBytes, rowBytes, numRows });
+            } else {
+                skipBytes += numBytes;
+            }
+            w = w > 1 ? (w >> 1) : 1;
+            h = h > 1 ? (h >> 1) : 1;
+        }
+    }
+    if (kept.empty() || !twidth || !theight) return nullptr;
+    if (dataOffset + totalSrcBytes > (uint64_t)fileSize.QuadPart) return nullptr;
+
+    const UINT keptMips = (UINT)kept.size();
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = twidth;
+    d.Height = theight;
+    d.DepthOrArraySize = 1;
+    d.MipLevels = (UINT16)keptMips;
+    d.Format = format;
+    d.SampleDesc = { 1, 0 };
+    d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (bind_flags & D3D11_BIND_UNORDERED_ACCESS) d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (bind_flags & D3D11_BIND_RENDER_TARGET) d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if (bind_flags & D3D11_BIND_DEPTH_STENCIL) d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(keptMips);
+    std::vector<UINT> rows(keptMips);
+    std::vector<UINT64> row_bytes(keptMips);
+    UINT64 totalUploadBytes = 0;
+    b.device->GetCopyableFootprints(&d, 0, keptMips, 0, layouts.data(), rows.data(), row_bytes.data(), &totalUploadBytes);
+    if (!totalUploadBytes || totalUploadBytes == UINT64_MAX) return nullptr;
+    for (UINT i = 0; i < keptMips; ++i) {
+        if (rows[i] != kept[i].numRows || row_bytes[i] != kept[i].rowBytes) return nullptr;
+    }
+
+    const bool timed = TexTiming::Armed();
+    LARGE_INTEGER tq{};
+    LARGE_INTEGER t0{};
+    LARGE_INTEGER t1{};
+    LARGE_INTEGER t2{};
+    if (timed) {
+        QueryPerformanceFrequency(&tq);
+        QueryPerformanceCounter(&t0);
+    }
+
+    ID3D12Resource* res = nullptr;
+    if (FAILED(b.device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&res))) ||
+        !res)
+        return nullptr;
+    DevName(res, L"wwmi mod texture");
+    OwnTexture(res);
+    if (timed) QueryPerformanceCounter(&t1);
+
+    PooledStaging ps{};
+    if (!AcquirePooledStaging(totalUploadBytes, &ps)) {
+        DisownBuffer(res);
+        res->Release();
+        return nullptr;
+    }
+
+    LARGE_INTEGER seekPos{};
+    seekPos.QuadPart = (LONGLONG)(dataOffset + skipBytes);
+    if (!SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN)) {
+        ReturnPooledStaging(ps, false);
+        DisownBuffer(res);
+        res->Release();
+        return nullptr;
+    }
+
+    std::vector<uint8_t> scratch;
+    for (UINT i = 0; i < keptMips; ++i) {
+        uint8_t* dst = ps.mapped + layouts[i].Offset;
+        if (layouts[i].Footprint.RowPitch == kept[i].rowBytes) {
+            if (!ReadExactFile(hFile, dst, kept[i].numBytes)) {
+                ReturnPooledStaging(ps, false);
+                DisownBuffer(res);
+                res->Release();
+                return nullptr;
+            }
+        } else {
+            scratch.resize(kept[i].numBytes);
+            if (!ReadExactFile(hFile, scratch.data(), kept[i].numBytes)) {
+                ReturnPooledStaging(ps, false);
+                DisownBuffer(res);
+                res->Release();
+                return nullptr;
+            }
+            const uint8_t* src = scratch.data();
+            for (UINT y = 0; y < rows[i]; ++y)
+                memcpy(dst + (size_t)y * layouts[i].Footprint.RowPitch, src + (size_t)y * kept[i].rowBytes,
+                    kept[i].rowBytes);
+        }
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = twidth;
+    desc.Height = theight;
+    desc.MipLevels = keptMips;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc = { 1, 0 };
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = bind_flags;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = misc_flags & ~D3D11_RESOURCE_MISC_TEXTURECUBE;
+
+    {
+        static std::atomic<int> n{ 0 };
+        if (n.fetch_add(1, std::memory_order_relaxed) < 64) {
+            logger::write("PORT-TEX(direct) %ux%u mips=%u array=1 fmt=%d bind=%x -> dx12 res=%p mips=%u array=%u",
+                desc.Width, desc.Height, desc.MipLevels, (int)desc.Format, desc.BindFlags, (void*)res,
+                (unsigned)res->GetDesc().MipLevels, (unsigned)res->GetDesc().DepthOrArraySize);
+        }
+    }
+
+    WrapTexture2D* w = new WrapTexture2D();
+    w->dx12 = res;
+    w->desc = desc;
+    uint64_t async_fv = 0;
+    const bool did_async = async_copy &&
+        SubmitAsyncTextureUpload(res, ps, keptMips, layouts.data(), totalUploadBytes, &async_fv);
+    if (did_async) {
+        if (out_async_fence) *out_async_fence = async_fv;
+    } else {
+        QueuePrestagedTextureUpload(w, ps, keptMips, std::move(layouts), totalUploadBytes);
+    }
+    if (timed) {
+        QueryPerformanceCounter(&t2);
+        const double ms = 1000.0 / (double)tq.QuadPart;
+        TexTiming::NoteCreate(res, desc.Width, desc.Height, desc.MipLevels, (uint32_t)desc.Format,
+            (double)(t1.QuadPart - t0.QuadPart) * ms, (double)(t2.QuadPart - t1.QuadPart) * ms);
+    }
+    return w;
 }
 
 } // namespace MigotoPort

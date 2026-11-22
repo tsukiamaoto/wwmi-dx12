@@ -24,6 +24,7 @@
 #include "textures/tex_crawl.h"
 #include "textures/tex_dhash_table.h"
 #include "textures/tex_defer.h"
+#include "textures/mru_preload.h"
 #include "textures/tex_gc.h"
 #include "textures/tex_replace.h"
 #include "migoto/dx12_wrap.h" // BackBufferForget
@@ -64,6 +65,7 @@ static void on_destroy_swapchain(swapchain*, bool resize)
     ::logger::write("Exit: swapchain destroyed -- stopping the watchdogs and saving the persistent settings");
     g_frame_step.ForgetSwapchain();
     g_watchdogs.Stop();
+    g_mru_preload.SaveOnExit();
     PortApi::SaveSettingsOnExit();
 }
 
@@ -77,9 +79,11 @@ static void on_destroy_device(device*)
     g_tex_crawl.FlushIfQuiet(0);
     g_tex_lod.OnExit();
     g_tex_look.OnExit();
+    g_mru_preload.SaveOnExit();
     g_tex_defer.Stop();
     g_tex_gc.Stop();
     g_tex_replace.Stop();
+    MigotoPort::AsyncCopyShutdown();
     PortApi::SaveSettingsOnExit();
 }
 
@@ -507,6 +511,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
         (int)g_settings.texlod_resemblance, (int)g_settings.texlod_cache, (int)MigotoPort::g_buffers_in_vram,
         TexBudgetName(g_settings.tex_mod_budget), (int)g_settings.tex_distance, (int)g_sk_toggles.game_batches,
         (int)g_tex_toggles.dhash_filters);
+    g_mru_preload.Init(g_addon.cso_dir);
     g_tex_defer.Start();
     if (g_settings.dx12_debug_layer) EnableDebugLayer();
     ::logger::write("Config: debug=%d (diagnostics %s, log level %d)", (int)g_debug, g_debug ? "ON" : "off",
@@ -534,6 +539,7 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE)
     g_tex_crawl.FlushIfQuiet(0);
     g_tex_lod.OnExit();
     g_tex_look.OnExit();
+    g_mru_preload.SaveOnExit();
     g_tex_defer.Stop();
     g_tex_gc.Stop();
     g_tex_replace.Stop();

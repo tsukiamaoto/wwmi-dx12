@@ -289,7 +289,9 @@ bool ShimObjectForeign(void* object)
 static void ReadyForGameDraw(ID3D12GraphicsCommandList* cl, ID3D11Resource* res, D3D12_RESOURCE_STATES to)
 {
     WrapResource* w = AsWrapResource(res);
-    if (w && w->dx12 && OwnedBuffer(w->dx12)) OwnedTransition(cl, w->dx12, to);
+    if (!w || !w->dx12 || !OwnedBuffer(w->dx12)) return;
+    FlushPendingUploadFor(cl, res);
+    OwnedTransition(cl, w->dx12, to);
 }
 
 void STDMETHODCALLTYPE Dx12Context::VSSetShaderResources(UINT s, UINT n, ID3D11ShaderResourceView* const* v)

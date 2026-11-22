@@ -15,6 +15,7 @@
 class TexDefer {
 public:
     void Start(); // hands the port its sink
+    void PublishCompleted(); // Present thread: publish textures whose async COPY-queue DMA has completed
     bool Pending(int mod) const { return Count(mod) != 0; } // a texture of this mod's namespace is still loading
     bool Loading() const { return in_flight_.load(std::memory_order_acquire) != 0; } // ... of any
     unsigned Loaded() const { return loaded_.load(std::memory_order_acquire); } // textures it made, ever
@@ -50,6 +51,16 @@ private:
         unsigned gen;
     };
     std::deque<Job> queue_; // under mtx_
+    struct ReadyItem {
+        std::wstring fq_name;
+        ID3D11Resource* res = nullptr;
+        uint64_t copy_fence = 0;
+        int mod = -1;
+        unsigned gen = 0;
+        unsigned maxsize = 0;
+        long long load_ticks = 0;
+    };
+    std::deque<ReadyItem> ready_; // under mtx_: loaded via async COPY queue, awaiting DMA fence before publish
     struct Return {
         unsigned maxsize;
         unsigned gen;
@@ -66,6 +77,9 @@ private:
         long long longest = 0;
         std::vector<std::wstring> namespaces;
     } burst_; // under mtx_
+    void CompleteJobLocked(int mod, unsigned gen, unsigned made, unsigned stale, unsigned smaller, long long load_ticks,
+        long long locked, BurstStats* out_done, bool* out_log);
+    static void LogBurst(const BurstStats& done_stats, long long freq);
     std::mutex mtx_;
     std::condition_variable cv_;
     bool stop_ = false; // under mtx_

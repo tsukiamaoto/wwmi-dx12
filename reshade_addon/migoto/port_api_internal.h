@@ -43,7 +43,7 @@ void RunSkelCopyUpdates();
 // (port_vars.cpp).
 void LoadDeferredNow(CustomResource* r);
 // ... and one a draw's slot is about to ask for, offered to the deferral sink if not loaded yet (port_vars.cpp).
-void DeferTexture(CustomResource* r);
+void DeferTexture(CustomResource* r, bool low_priority = false);
 // ... and whether the background loader still has it.
 bool DeferredPending(CustomResource* r);
 

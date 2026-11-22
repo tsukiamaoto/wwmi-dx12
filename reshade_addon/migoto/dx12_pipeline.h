@@ -23,6 +23,7 @@
 // ===========================================================================
 
 #include <d3d11_1.h>
+#include <vector>
 #include <d3d12.h>
 #include <cstdint>
 
@@ -172,13 +173,35 @@ void SetBufCopyShader(const void* dxil, size_t bytes);
 bool CopyBufferCs(ID3D12GraphicsCommandList* cl, struct WrapResource* dst, UINT64 dst_off, struct WrapResource* src,
     UINT64 src_off, UINT64 bytes);
 
+struct PooledStaging {
+    ID3D12Resource* res = nullptr;
+    uint8_t* mapped = nullptr;
+    UINT64 cap = 0;
+    bool from_pool = false;
+};
+
+bool AcquirePooledStaging(UINT64 bytes, PooledStaging* out);
+void ReturnPooledStaging(const PooledStaging& ps, bool gpu_used);
+bool SubmitAsyncTextureUpload(ID3D12Resource* dst_tex, const PooledStaging& ps, UINT subresources,
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT64 total_bytes, uint64_t* out_fence);
+bool AsyncCopyPassed(uint64_t fence_val);
+void AsyncCopyDrainStaging();
+void AsyncCopyShutdown();
 void QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t seq = 0);
 void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data, UINT subresources, uint64_t seq = 0);
+void QueuePrestagedTextureUpload(ID3D11Resource* dst, const PooledStaging& ps, UINT subresources,
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>&& layouts, UINT64 total_bytes, uint64_t seq = 0);
 void FlushPendingUploads(ID3D12GraphicsCommandList* cl);
+void FlushPendingUploadFor(ID3D12GraphicsCommandList* cl, ID3D11Resource* res);
 void DiscardRedrawUploads();
 bool UploadPendingFor(ID3D11Resource* res); // its copy is not recorded on a command list yet
 uint64_t NextUploadSeq();
 bool ListHoldsUpload(ID3D12GraphicsCommandList* cl, const struct WrapResource* wr);
+
+// Zero-copy fast path: reads standard 2D DDS payloads directly into a pooled UPLOAD buffer (nullptr -> fallback to DirectXTK).
+// When async_copy is true, submits CopyTextureRegion on the dedicated D3D12 COPY queue and writes its fence value to *out_async_fence.
+ID3D11Resource* TryLoadDdsDirectToUpload(const wchar_t* filename, size_t maxsize, UINT bind_flags, UINT misc_flags,
+    bool force_srgb, bool async_copy = false, uint64_t* out_async_fence = nullptr);
 
 // Descriptor heaps OURS alone. Never the game's shared bindless heap.
 bool EnsureHeaps();

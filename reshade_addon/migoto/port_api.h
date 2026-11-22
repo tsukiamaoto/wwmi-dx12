@@ -306,13 +306,17 @@ struct DeferredTexture {
     unsigned misc_flags;
     bool force_srgb;
     unsigned maxsize = 0; // the loader's: mips larger than this are skipped; 0 = all
+    bool low_priority = false; // background MRU preload: queued behind any live on-screen texture loads
 };
 // The first time a draw's slot asks for a .dds [Resource] not yet loaded, `sink` is offered it, on the drawing thread
 // under the engine lock. Taken: the slot gets null until PublishDeferredTexture. Not taken, or no sink: it loads
 // there, as on DX11.
 void SetTextureDeferral(bool (*sink)(const DeferredTexture& t, void* user), void* user);
-ID3D11Resource* LoadDeferredTexture(const DeferredTexture& t);
+ID3D11Resource* LoadDeferredTexture(
+    const DeferredTexture& t, bool async_copy = false, uint64_t* out_async_fence = nullptr);
 bool PublishDeferredTexture(const wchar_t* fq_name, ID3D11Resource* res);
+// Enqueue a single .dds [Resource*] for low-priority background preloading if not substantiated yet.
+bool PreloadDeferredTexture(const wchar_t* fq_name);
 // This thread's section run bound a slot to a texture still loading in the background, whatever its namespace: its
 // null is "not yet". Cleared as a section run starts.
 void ClearBoundLoading();

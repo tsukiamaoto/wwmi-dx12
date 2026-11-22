@@ -151,6 +151,7 @@ exit /b 0</Command>
     <ClCompile Include="reshade_addon\rabbitfx\rfx_patch_srvs.cpp" />
     <ClCompile Include="reshade_addon\rabbitfx\rfx_toggles.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_defer.cpp" />
+    <ClCompile Include="reshade_addon\textures\mru_preload.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_replace.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_encode.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_budget.cpp" />

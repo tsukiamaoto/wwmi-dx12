@@ -19,6 +19,7 @@
 
 #include <d3d11_1.h>
 #include <d3d12.h>
+#include <atomic>
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -111,6 +112,7 @@ struct WrapResource {
     std::vector<unsigned char> uploaded;
     uint64_t uploaded_seq = 0;
     uint64_t queued_seq = 0;
+    std::atomic<bool> has_pending_upload{ false };
     UploadRecord flushed;
     virtual ~WrapResource();
 };

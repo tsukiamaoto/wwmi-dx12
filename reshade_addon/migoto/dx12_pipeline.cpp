@@ -738,9 +738,12 @@ void WriteCbvDescriptor(ID3D11Buffer* cb, const CbWindow& bound, UINT64 shader_b
 
 struct PendingUpload {
     ID3D11Resource* dst = nullptr; // our wrapper; we hold a ref until the copy is recorded
-    ID3D12Resource* staging = nullptr; // a private staging buffer, or the ring (from_ring)
+    ID3D12Resource* staging = nullptr; // a private/pooled staging buffer, or the ring (from_ring)
+    uint8_t* staging_mapped = nullptr; // persistent map pointer for pooled staging buffers
+    UINT64 staging_cap = 0; // allocation size of staging buffer (for pool reuse)
     bool is_texture = false;
     bool from_ring = false; // source is the upload ring: nothing to retire or release
+    bool from_pool = false; // source belongs to StagingPool: return on completion
     bool for_redraw = false; // queued during PresentRedraw: flushed only on the redraw list
     UINT subresources = 1;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts; // ABSOLUTE offsets into `staging`
@@ -762,6 +765,27 @@ std::vector<RetiredBuf>& RetiredStaging()
 {
     static auto* v = new std::vector<RetiredBuf>();
     return *v;
+}
+struct PooledEntry {
+    ID3D12Resource* res = nullptr;
+    uint8_t* mapped = nullptr;
+    UINT64 cap = 0;
+    uint64_t stamp = 0;
+    uint64_t idle_since = 0;
+};
+struct StagingPoolState {
+    ID3D12Device* dev = nullptr;
+    std::vector<PooledEntry> entries;
+    UINT64 total_bytes = 0;
+};
+constexpr UINT64 kStagingPoolMinEntry = 1ull << 20;
+constexpr UINT64 kStagingPoolMaxEntry = 128ull << 20;
+constexpr UINT64 kStagingPoolMaxBytes = 320ull << 20;
+constexpr uint64_t kStagingPoolIdleMs = 15000;
+StagingPoolState& StagingPool()
+{
+    static auto* p = new StagingPoolState();
+    return *p;
 }
 struct UploadRing {
     ID3D12Resource* res = nullptr;
@@ -1161,10 +1185,453 @@ ID3D12Resource* MakeStaging(UINT64 bytes)
     ID3D12Resource* r = nullptr;
     if (FAILED(CreateD3D12Buffer(b.device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ, &r)))
         return nullptr;
+    DevName(r, L"wwmi upload staging");
     return r;
 }
 
+UINT64 StagingBucketSize(UINT64 bytes)
+{
+    if (bytes <= kStagingPoolMinEntry) return kStagingPoolMinEntry;
+    if (bytes <= (64ull << 20)) {
+        UINT64 b = kStagingPoolMinEntry;
+        while (b < bytes) b <<= 1;
+        return b;
+    }
+    if (bytes <= (96ull << 20)) return 96ull << 20;
+    if (bytes <= kStagingPoolMaxEntry) return kStagingPoolMaxEntry;
+    return (bytes + 65535ull) & ~65535ull;
+}
+
+void CopyTextureSubresourceRows(
+    uint8_t* dst_rows, UINT dst_pitch, const uint8_t* src_rows, UINT src_pitch, UINT rows, UINT64 row_bytes)
+{
+    if (!dst_rows || !src_rows || !rows || !row_bytes) return;
+    if (dst_pitch == src_pitch && row_bytes == src_pitch) {
+        memcpy(dst_rows, src_rows, (size_t)rows * (size_t)row_bytes);
+        return;
+    }
+    for (UINT y = 0; y < rows; ++y)
+        memcpy(dst_rows + (size_t)y * dst_pitch, src_rows + (size_t)y * src_pitch, (size_t)row_bytes);
+}
+
+void ReturnStagingLocked(ID3D12Resource* res, uint8_t* mapped, UINT64 cap, bool from_pool, bool gpu_used,
+    std::vector<ID3D12Resource*>& immediate_release)
+{
+    if (!res) return;
+    if (from_pool && mapped && cap <= kStagingPoolMaxEntry) {
+        auto& pool = StagingPool();
+        if (pool.total_bytes + cap <= kStagingPoolMaxBytes) {
+            pool.entries.push_back({ res, mapped, cap, gpu_used ? GpuStamp() : 0u, GetTickCount64() });
+            pool.total_bytes += cap;
+            return;
+        }
+    }
+    if (gpu_used) {
+        RetiredStaging().push_back({ res, GpuStamp() });
+    } else {
+        immediate_release.push_back(res);
+    }
+}
+
+void RecordUploadAndRetire(ID3D12GraphicsCommandList* cl, PendingUpload& u)
+{
+    WrapResource* wr = AsWrapResource(u.dst);
+    // RINGSTALE: did this upload outwait the ring's protection before its copy is recorded?
+    if (u.from_ring && wr && wr->dx12 && GpuPassed(u.queued_stamp)) {
+        const unsigned long long n = g_ring_expired.fetch_add(1) + 1;
+        if (n <= 16 || (n % 256) == 0) {
+            const D3D12_RESOURCE_DESC rd = wr->dx12->GetDesc();
+            logger::write("RINGSTALE expired #%llu: %s dst=%p %llux%u fmt=%d mips=%u, %llu B: the GPU passed its "
+                          "ring stamp %llu before its copy was recorded -- unprotected while it waited",
+                n, u.is_texture ? "texture" : "buffer", (void*)wr->dx12, (unsigned long long)rd.Width,
+                (unsigned)rd.Height, (int)rd.Format, (unsigned)rd.MipLevels, (unsigned long long)u.bytes,
+                (unsigned long long)u.queued_stamp);
+        }
+    }
+    if (wr && wr->dx12) {
+        Transition(cl, wr, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (u.is_texture) {
+            for (UINT i = 0; i < u.subresources; ++i) {
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = u.staging;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint = u.layouts[i];
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = wr->dx12;
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.SubresourceIndex = i;
+                cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            ProfGpuWork(PGW_UploadTex, u.bytes);
+            RemovalPin::Ours(cl, "port-upload-tex");
+            TexTiming::NoteFlushed(wr->dx12, u.bytes);
+        } else {
+            cl->CopyBufferRegion(wr->dx12, 0, u.staging, u.src_offset, u.bytes);
+            ProfGpuWork(PGW_Upload, u.bytes);
+            RemovalPin::Ours(cl, "port-upload");
+        }
+        Transition(cl, wr, D3D12_RESOURCE_STATE_COMMON);
+    }
+    std::vector<ID3D12Resource*> dead;
+    {
+        std::lock_guard<std::mutex> l(Mtx());
+        if (u.from_ring) {
+            const UINT64 lo =
+                u.is_texture ? (u.layouts.empty() ? u.src_offset : u.layouts.front().Offset) : u.src_offset;
+            RingTouch(lo, u.bytes);
+        } else {
+            ReturnStagingLocked(u.staging, u.staging_mapped, u.staging_cap, u.from_pool, /*gpu_used*/ true, dead);
+        }
+    }
+    for (ID3D12Resource* r : dead) r->Release();
+    if (u.dst) u.dst->Release();
+}
+
 } // namespace
+
+bool AcquirePooledStaging(UINT64 bytes, PooledStaging* out)
+{
+    if (!out || !bytes) return false;
+    *out = PooledStaging{};
+    const Dx12Bridge& b = GetDx12Bridge();
+    if (!b.device) return false;
+
+    const bool poolable = bytes <= kStagingPoolMaxEntry;
+    const UINT64 alloc_bytes = poolable ? StagingBucketSize(bytes) : bytes;
+
+    if (poolable) {
+        AsyncCopyDrainStaging(); // immediately reclaim any staging buffers whose async DMA copy already finished
+        std::vector<ID3D12Resource*> stale;
+        {
+            std::lock_guard<std::mutex> l(Mtx());
+            auto& pool = StagingPool();
+            if (pool.dev && pool.dev != b.device) {
+                for (const PooledEntry& e : pool.entries)
+                    if (e.res) stale.push_back(e.res);
+                pool.entries.clear();
+                pool.total_bytes = 0;
+            }
+            pool.dev = b.device;
+
+            size_t best = SIZE_MAX;
+            const UINT64 max_fit = alloc_bytes * 2;
+            for (size_t i = 0; i < pool.entries.size(); ++i) {
+                const PooledEntry& e = pool.entries[i];
+                if (e.cap < bytes || e.cap > max_fit) continue;
+                if (e.stamp != 0 && !GpuPassed(e.stamp)) continue;
+                if (best == SIZE_MAX || e.cap < pool.entries[best].cap) best = i;
+            }
+            if (best != SIZE_MAX) {
+                const PooledEntry e = pool.entries[best];
+                pool.total_bytes = pool.total_bytes >= e.cap ? (pool.total_bytes - e.cap) : 0;
+                pool.entries[best] = pool.entries.back();
+                pool.entries.pop_back();
+                out->res = e.res;
+                out->mapped = e.mapped;
+                out->cap = e.cap;
+                out->from_pool = true;
+            }
+        }
+        for (ID3D12Resource* r : stale) r->Release();
+        if (out->res) return true;
+    }
+
+    ID3D12Resource* r = nullptr;
+    if (FAILED(CreateD3D12Buffer(b.device, D3D12_HEAP_TYPE_UPLOAD, alloc_bytes, D3D12_RESOURCE_STATE_GENERIC_READ, &r)) ||
+        !r)
+        return false;
+    DevName(r, L"wwmi upload staging");
+    void* p = nullptr;
+    D3D12_RANGE none{ 0, 0 };
+    if (FAILED(r->Map(0, &none, &p)) || !p) {
+        r->Release();
+        return false;
+    }
+    out->res = r;
+    out->mapped = static_cast<uint8_t*>(p);
+    out->cap = alloc_bytes;
+    out->from_pool = poolable;
+    return true;
+}
+
+void ReturnPooledStaging(const PooledStaging& ps, bool gpu_used)
+{
+    if (!ps.res) return;
+    std::vector<ID3D12Resource*> dead;
+    {
+        std::lock_guard<std::mutex> l(Mtx());
+        ReturnStagingLocked(ps.res, ps.mapped, ps.cap, ps.from_pool, gpu_used, dead);
+    }
+    for (ID3D12Resource* r : dead) r->Release();
+}
+
+namespace {
+
+struct AsyncCopySlot {
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* cl = nullptr;
+    uint64_t fence_val = 0;
+};
+struct AsyncInflightStaging {
+    PooledStaging ps;
+    ID3D12Resource* dst = nullptr;
+    uint64_t fence_val = 0;
+};
+struct AsyncCopyState {
+    static constexpr unsigned kSlots = 8;
+    std::mutex mtx;
+    ID3D12Device* dev = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE event = nullptr;
+    uint64_t next_val = 0;
+    AsyncCopySlot slots[kSlots]{};
+    std::vector<AsyncInflightStaging> inflight;
+    bool failed = false;
+    bool shutdown = false;
+
+    void ReleaseLocked(std::vector<ID3D12Resource*>& dead_res)
+    {
+        if (fence && event && next_val > 0 && fence->GetCompletedValue() < next_val) {
+            if (SUCCEEDED(fence->SetEventOnCompletion(next_val, event))) WaitForSingleObject(event, 3000);
+        }
+        for (const AsyncInflightStaging& s : inflight) {
+            if (s.ps.res) dead_res.push_back(s.ps.res);
+            if (s.dst) dead_res.push_back(s.dst);
+        }
+        inflight.clear();
+        for (AsyncCopySlot& s : slots) {
+            if (s.cl) {
+                s.cl->Release();
+                s.cl = nullptr;
+            }
+            if (s.alloc) {
+                s.alloc->Release();
+                s.alloc = nullptr;
+            }
+            s.fence_val = 0;
+        }
+        if (fence) {
+            fence->Release();
+            fence = nullptr;
+        }
+        if (queue) {
+            queue->Release();
+            queue = nullptr;
+        }
+        if (event) {
+            CloseHandle(event);
+            event = nullptr;
+        }
+        dev = nullptr;
+        next_val = 0;
+    }
+
+    bool EnsureLocked(ID3D12Device* d, std::vector<ID3D12Resource*>& dead_staging)
+    {
+        if (shutdown || failed || !d) return false;
+        if (queue && dev == d) return true;
+        if (queue && dev != d) ReleaseLocked(dead_staging);
+
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+        if (FAILED(d->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) || !queue) {
+            failed = true;
+            return false;
+        }
+        DevName(queue, L"wwmi async copy queue");
+        if (FAILED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) || !fence) {
+            ReleaseLocked(dead_staging);
+            failed = true;
+            return false;
+        }
+        DevName(fence, L"wwmi async copy fence");
+        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event) {
+            ReleaseLocked(dead_staging);
+            failed = true;
+            return false;
+        }
+        for (unsigned i = 0; i < kSlots; ++i) {
+            if (FAILED(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&slots[i].alloc))) ||
+                !slots[i].alloc ||
+                FAILED(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, slots[i].alloc, nullptr,
+                    IID_PPV_ARGS(&slots[i].cl))) ||
+                !slots[i].cl) {
+                ReleaseLocked(dead_staging);
+                failed = true;
+                return false;
+            }
+            slots[i].cl->Close();
+            DevName(slots[i].alloc, L"wwmi async copy alloc");
+            DevName(slots[i].cl, L"wwmi async copy list");
+            slots[i].fence_val = 0;
+        }
+        dev = d;
+        logger::write("PORT: dedicated D3D12 COPY queue ready (%u slots) for async texture DMA", kSlots);
+        return true;
+    }
+
+    void CollectDoneStagingLocked(std::vector<PooledStaging>& reclaimed, std::vector<ID3D12Resource*>& done_dst)
+    {
+        if (!fence || inflight.empty()) return;
+        const uint64_t done = fence->GetCompletedValue();
+        size_t keep = 0;
+        for (size_t i = 0; i < inflight.size(); ++i) {
+            if (done >= inflight[i].fence_val) {
+                reclaimed.push_back(inflight[i].ps);
+                if (inflight[i].dst) done_dst.push_back(inflight[i].dst);
+            } else {
+                if (keep != i) inflight[keep] = inflight[i];
+                ++keep;
+            }
+        }
+        inflight.resize(keep);
+    }
+};
+
+AsyncCopyState& AsyncCopy()
+{
+    static auto* s = new AsyncCopyState();
+    return *s;
+}
+
+} // namespace
+
+void AsyncCopyDrainStaging()
+{
+    std::vector<PooledStaging> reclaimed;
+    std::vector<ID3D12Resource*> done_dst;
+    {
+        AsyncCopyState& ac = AsyncCopy();
+        std::lock_guard<std::mutex> l(ac.mtx);
+        ac.CollectDoneStagingLocked(reclaimed, done_dst);
+    }
+    for (ID3D12Resource* r : done_dst) r->Release();
+    if (reclaimed.empty()) return;
+    std::vector<ID3D12Resource*> dead;
+    {
+        std::lock_guard<std::mutex> l(Mtx());
+        for (const PooledStaging& ps : reclaimed)
+            ReturnStagingLocked(ps.res, ps.mapped, ps.cap, ps.from_pool, /*gpu_used*/ false, dead);
+    }
+    for (ID3D12Resource* r : dead) r->Release();
+}
+
+bool AsyncCopyPassed(uint64_t fence_val)
+{
+    if (fence_val == 0) return true;
+    AsyncCopyState& ac = AsyncCopy();
+    std::lock_guard<std::mutex> l(ac.mtx);
+    if (!ac.fence) return true;
+    return ac.fence->GetCompletedValue() >= fence_val;
+}
+
+bool SubmitAsyncTextureUpload(ID3D12Resource* dst_tex, const PooledStaging& ps, UINT subresources,
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT64 total_bytes, uint64_t* out_fence)
+{
+    if (out_fence) *out_fence = 0;
+    if (!dst_tex || !ps.res || !subresources || !layouts || !out_fence) return false;
+    const Dx12Bridge& b = GetDx12Bridge();
+    if (!b.device) return false;
+
+    std::vector<PooledStaging> reclaimed;
+    std::vector<ID3D12Resource*> dead_old;
+    uint64_t submitted_fv = 0;
+    bool ok = false;
+    {
+        AsyncCopyState& ac = AsyncCopy();
+        std::lock_guard<std::mutex> l(ac.mtx);
+        if (ac.EnsureLocked(b.device, dead_old)) {
+            ac.CollectDoneStagingLocked(reclaimed, dead_old);
+            const uint64_t completed = ac.fence->GetCompletedValue();
+            unsigned pick = AsyncCopyState::kSlots;
+            unsigned oldest = 0;
+            for (unsigned i = 0; i < AsyncCopyState::kSlots; ++i) {
+                if (ac.slots[i].fence_val == 0 || completed >= ac.slots[i].fence_val) {
+                    pick = i;
+                    break;
+                }
+                if (ac.slots[i].fence_val < ac.slots[oldest].fence_val) oldest = i;
+            }
+            if (pick == AsyncCopyState::kSlots) {
+                pick = oldest;
+                if (SUCCEEDED(ac.fence->SetEventOnCompletion(ac.slots[pick].fence_val, ac.event)))
+                    WaitForSingleObject(ac.event, 2000);
+                ac.CollectDoneStagingLocked(reclaimed, dead_old);
+            }
+            if (ac.slots[pick].fence_val == 0 || ac.fence->GetCompletedValue() >= ac.slots[pick].fence_val) {
+                AsyncCopySlot& s = ac.slots[pick];
+                if (SUCCEEDED(s.alloc->Reset()) && SUCCEEDED(s.cl->Reset(s.alloc, nullptr))) {
+                    // dst_tex was just created in COMMON (never published to Direct queue); COPY queue implicitly
+                    // promotes COMMON -> COPY_DEST and decays back to COMMON upon ExecuteCommandLists completion.
+                    for (UINT i = 0; i < subresources; ++i) {
+                        D3D12_TEXTURE_COPY_LOCATION src{};
+                        src.pResource = ps.res;
+                        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                        src.PlacedFootprint = layouts[i];
+                        D3D12_TEXTURE_COPY_LOCATION dst{};
+                        dst.pResource = dst_tex;
+                        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                        dst.SubresourceIndex = i;
+                        s.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                    }
+                    if (SUCCEEDED(s.cl->Close())) {
+                        ID3D12CommandList* list = s.cl;
+                        ac.queue->ExecuteCommandLists(1, &list);
+                        const uint64_t fv = ++ac.next_val;
+                        if (SUCCEEDED(ac.queue->Signal(ac.fence, fv))) {
+                            s.fence_val = fv;
+                            dst_tex->AddRef();
+                            ac.inflight.push_back({ ps, dst_tex, fv });
+                            submitted_fv = fv;
+                            ok = true;
+                        } else {
+                            ac.failed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (ID3D12Resource* r : dead_old) r->Release();
+    if (!reclaimed.empty()) {
+        std::vector<ID3D12Resource*> dead_rec;
+        {
+            std::lock_guard<std::mutex> l(Mtx());
+            for (const PooledStaging& rps : reclaimed)
+                ReturnStagingLocked(rps.res, rps.mapped, rps.cap, rps.from_pool, /*gpu_used*/ false, dead_rec);
+        }
+        for (ID3D12Resource* r : dead_rec) r->Release();
+    }
+    if (ok) {
+        *out_fence = submitted_fv;
+        ProfGpuWork(PGW_UploadTex, total_bytes);
+        TexTiming::NoteFlushed(dst_tex, total_bytes);
+    }
+    return ok;
+}
+
+void AsyncCopyShutdown()
+{
+    std::vector<ID3D12Resource*> dead;
+    {
+        AsyncCopyState& ac = AsyncCopy();
+        std::lock_guard<std::mutex> l(ac.mtx);
+        ac.shutdown = true;
+        ac.ReleaseLocked(dead);
+    }
+    {
+        std::lock_guard<std::mutex> l(Mtx());
+        auto& pool = StagingPool();
+        for (const PooledEntry& e : pool.entries)
+            if (e.res) dead.push_back(e.res);
+        pool.entries.clear();
+        pool.total_bytes = 0;
+    }
+    for (ID3D12Resource* r : dead) r->Release();
+}
 
 void QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t seq)
 {
@@ -1186,18 +1653,17 @@ void QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t s
         u.src_offset = off;
         u.from_ring = true;
     } else {
-        ID3D12Resource* staging = MakeStaging(bytes);
-        if (!staging) {
+        PooledStaging ps;
+        if (!AcquirePooledStaging(bytes, &ps)) {
             logger::write("PORT: upload staging FAILED (%zu bytes)", bytes);
             return;
         }
-        void* p = nullptr;
-        D3D12_RANGE none{ 0, 0 };
-        if (SUCCEEDED(staging->Map(0, &none, &p)) && p) {
-            memcpy(p, data, bytes);
-            staging->Unmap(0, nullptr);
-        }
-        u.staging = staging;
+        memcpy(ps.mapped, data, bytes);
+        if (!ps.from_pool) ps.res->Unmap(0, nullptr);
+        u.staging = ps.res;
+        u.staging_mapped = ps.from_pool ? ps.mapped : nullptr;
+        u.staging_cap = ps.cap;
+        u.from_pool = ps.from_pool;
     }
     u.dst = dst;
     u.seq = seq;
@@ -1205,6 +1671,7 @@ void QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t s
     dst->AddRef();
     std::lock_guard<std::mutex> l(Mtx());
     if (!u.for_redraw) wr->queued_seq = seq;
+    wr->has_pending_upload.store(true, std::memory_order_release);
     Uploads().push_back(std::move(u));
 }
 
@@ -1238,11 +1705,8 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
             if (it->dst != dst || !it->is_texture || !it->from_ring || it->subresources != 1 ||
                 it->staging != Ring().res || it->for_redraw != for_redraw)
                 continue;
-            uint8_t* dst_rows = Ring().mapped + it->layouts[0].Offset;
-            const uint8_t* src_rows = (const uint8_t*)data[0].pSysMem;
-            for (UINT y = 0; y < rows[0]; ++y)
-                memcpy(dst_rows + (size_t)y * it->layouts[0].Footprint.RowPitch,
-                    src_rows + (size_t)y * data[0].SysMemPitch, (size_t)row_bytes[0]);
+            CopyTextureSubresourceRows(Ring().mapped + it->layouts[0].Offset, it->layouts[0].Footprint.RowPitch,
+                (const uint8_t*)data[0].pSysMem, data[0].SysMemPitch, rows[0], row_bytes[0]);
             it->seq = seq;
             if (!for_redraw) wr->queued_seq = seq;
             ProfGpuWork(PGW_UploadDedup, 0);
@@ -1254,6 +1718,7 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
     uint8_t* base = nullptr; // where layouts[i].Offset is relative to
     UINT64 off = 0;
     bool ring = false;
+    PooledStaging ps{};
     {
         std::lock_guard<std::mutex> l(Mtx());
         ring = RingAlloc(total, &off);
@@ -1264,33 +1729,27 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
         staging = Ring().res;
         base = Ring().mapped; // absolute offsets: base is the ring's start
     } else {
-        staging = MakeStaging(total);
-        if (!staging) {
+        if (!AcquirePooledStaging(total, &ps)) {
             logger::write("PORT: texture upload staging FAILED (%llu bytes)", (unsigned long long)total);
             return;
         }
-        D3D12_RANGE none{ 0, 0 };
-        if (FAILED(staging->Map(0, &none, (void**)&base)) || !base) {
-            staging->Release();
-            return;
-        }
+        staging = ps.res;
+        base = ps.mapped;
     }
     for (UINT i = 0; i < subresources; ++i) {
-        uint8_t* dst_rows = base + layouts[i].Offset;
-        const uint8_t* src_rows = (const uint8_t*)data[i].pSysMem;
-        if (!src_rows) continue;
-        for (UINT y = 0; y < rows[i]; ++y) {
-            memcpy(dst_rows + (size_t)y * layouts[i].Footprint.RowPitch, src_rows + (size_t)y * data[i].SysMemPitch,
-                (size_t)row_bytes[i]);
-        }
+        CopyTextureSubresourceRows(base + layouts[i].Offset, layouts[i].Footprint.RowPitch,
+            (const uint8_t*)data[i].pSysMem, data[i].SysMemPitch, rows[i], row_bytes[i]);
     }
-    if (!ring) staging->Unmap(0, nullptr);
+    if (!ring && !ps.from_pool) staging->Unmap(0, nullptr);
 
     PendingUpload u;
     u.dst = dst;
     dst->AddRef();
     u.staging = staging;
+    u.staging_mapped = (!ring && ps.from_pool) ? ps.mapped : nullptr;
+    u.staging_cap = ps.cap;
     u.from_ring = ring;
+    u.from_pool = !ring && ps.from_pool;
     u.for_redraw = for_redraw;
     u.is_texture = true;
     u.subresources = subresources;
@@ -1300,6 +1759,37 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
     u.seq = seq;
     std::lock_guard<std::mutex> l(Mtx());
     if (!for_redraw) wr->queued_seq = seq;
+    wr->has_pending_upload.store(true, std::memory_order_release);
+    Uploads().push_back(std::move(u));
+}
+
+void QueuePrestagedTextureUpload(ID3D11Resource* dst, const PooledStaging& ps, UINT subresources,
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>&& layouts, UINT64 total_bytes, uint64_t seq)
+{
+    WrapResource* wr = AsWrapResource(dst);
+    if (!wr || !wr->dx12 || !ps.res || !subresources) {
+        ReturnPooledStaging(ps, false);
+        return;
+    }
+    if (!ps.from_pool) ps.res->Unmap(0, nullptr);
+    PendingUpload u;
+    u.dst = dst;
+    dst->AddRef();
+    u.staging = ps.res;
+    u.staging_mapped = ps.from_pool ? ps.mapped : nullptr;
+    u.staging_cap = ps.cap;
+    u.from_ring = false;
+    u.from_pool = ps.from_pool;
+    u.for_redraw = g_present_redraw;
+    u.is_texture = true;
+    u.subresources = subresources;
+    u.layouts = std::move(layouts);
+    u.bytes = total_bytes;
+    u.queued_stamp = GpuStamp();
+    u.seq = seq;
+    std::lock_guard<std::mutex> l(Mtx());
+    if (!u.for_redraw) wr->queued_seq = seq;
+    wr->has_pending_upload.store(true, std::memory_order_release);
     Uploads().push_back(std::move(u));
 }
 
@@ -1321,13 +1811,16 @@ bool ListHoldsUpload(ID3D12GraphicsCommandList* cl, const WrapResource* wr)
 void DiscardRedrawUploads()
 {
     std::vector<ID3D11Resource*> release_dst;
+    std::vector<ID3D12Resource*> release_staging;
     {
         std::lock_guard<std::mutex> l(Mtx());
         auto& up = Uploads();
         size_t keep = 0;
         for (size_t i = 0; i < up.size(); ++i) {
             if (up[i].for_redraw) {
-                if (!up[i].from_ring && up[i].staging) RetiredStaging().push_back({ up[i].staging, GpuStamp() });
+                if (!up[i].from_ring && up[i].staging)
+                    ReturnStagingLocked(
+                        up[i].staging, up[i].staging_mapped, up[i].staging_cap, up[i].from_pool, false, release_staging);
                 if (up[i].dst) release_dst.push_back(up[i].dst);
             } else {
                 if (keep != i) up[keep] = std::move(up[i]);
@@ -1335,7 +1828,19 @@ void DiscardRedrawUploads()
             }
         }
         up.resize(keep);
+        for (ID3D11Resource* d : release_dst) {
+            if (WrapResource* wr = AsWrapResource(d)) {
+                bool still = false;
+                for (const PendingUpload& rem : up)
+                    if (rem.dst == d) {
+                        still = true;
+                        break;
+                    }
+                if (!still) wr->has_pending_upload.store(false, std::memory_order_release);
+            }
+        }
     }
+    for (ID3D12Resource* r : release_staging) r->Release();
     for (ID3D11Resource* d : release_dst) d->Release();
 }
 
@@ -1346,6 +1851,7 @@ void FlushPendingUploads(ID3D12GraphicsCommandList* cl)
     const uint64_t recording = ListRecording(cl);
     const bool want_redraw = g_present_redraw;
     std::vector<PendingUpload> todo;
+    std::vector<ID3D12Resource*> release_retired;
     {
         std::lock_guard<std::mutex> l(Mtx());
         auto& up = Uploads();
@@ -1363,67 +1869,64 @@ void FlushPendingUploads(ID3D12GraphicsCommandList* cl)
         }
         up.resize(keep);
         if (todo.empty()) return;
+        for (const PendingUpload& u : todo) {
+            if (WrapResource* wr = AsWrapResource(u.dst)) {
+                bool still = false;
+                for (const PendingUpload& rem : up)
+                    if (rem.dst == u.dst) {
+                        still = true;
+                        break;
+                    }
+                if (!still) wr->has_pending_upload.store(false, std::memory_order_release);
+            }
+        }
         // Release only what the GPU is demonstrably done with, instead of everything queued last time.
         auto& ret = RetiredStaging();
         size_t rkeep = 0;
         for (size_t i = 0; i < ret.size(); ++i) {
             if (GpuPassed(ret[i].stamp)) {
-                if (ret[i].res) ret[i].res->Release();
+                if (ret[i].res) release_retired.push_back(ret[i].res);
             } else
                 ret[rkeep++] = ret[i];
         }
         ret.resize(rkeep);
     }
+    for (ID3D12Resource* r : release_retired) r->Release();
     GpuBracket _gt(cl, GT_UploadFlush);
-    for (PendingUpload& u : todo) {
-        WrapResource* wr = AsWrapResource(u.dst);
-        // RINGSTALE: did this upload outwait the ring's protection before its copy is recorded?
-        if (u.from_ring && wr && wr->dx12 && GpuPassed(u.queued_stamp)) {
-            const unsigned long long n = g_ring_expired.fetch_add(1) + 1;
-            if (n <= 16 || (n % 256) == 0) {
-                const D3D12_RESOURCE_DESC rd = wr->dx12->GetDesc();
-                logger::write("RINGSTALE expired #%llu: %s dst=%p %llux%u fmt=%d mips=%u, %llu B: the GPU passed its "
-                              "ring stamp %llu before its copy was recorded -- unprotected while it waited",
-                    n, u.is_texture ? "texture" : "buffer", (void*)wr->dx12, (unsigned long long)rd.Width,
-                    (unsigned)rd.Height, (int)rd.Format, (unsigned)rd.MipLevels, (unsigned long long)u.bytes,
-                    (unsigned long long)u.queued_stamp);
-            }
-        }
-        if (wr && wr->dx12) {
-            Transition(cl, wr, D3D12_RESOURCE_STATE_COPY_DEST);
-            if (u.is_texture) {
-                for (UINT i = 0; i < u.subresources; ++i) {
-                    D3D12_TEXTURE_COPY_LOCATION src{};
-                    src.pResource = u.staging;
-                    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                    src.PlacedFootprint = u.layouts[i];
-                    D3D12_TEXTURE_COPY_LOCATION dst{};
-                    dst.pResource = wr->dx12;
-                    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                    dst.SubresourceIndex = i;
-                    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-                }
-                ProfGpuWork(PGW_UploadTex, u.bytes);
-                RemovalPin::Ours(cl, "port-upload-tex");
-                TexTiming::NoteFlushed(wr->dx12, u.bytes);
-            } else {
-                cl->CopyBufferRegion(wr->dx12, 0, u.staging, u.src_offset, u.bytes);
-                ProfGpuWork(PGW_Upload, u.bytes);
-                RemovalPin::Ours(cl, "port-upload");
-            }
-            Transition(cl, wr, D3D12_RESOURCE_STATE_COMMON);
-        }
-        std::lock_guard<std::mutex> l(Mtx());
-        if (u.from_ring) {
-            const UINT64 lo =
-                u.is_texture ? (u.layouts.empty() ? u.src_offset : u.layouts.front().Offset) : u.src_offset;
-            RingTouch(lo, u.bytes);
-        } else {
-            RetiredStaging().push_back({ u.staging, GpuStamp() });
-        }
-        if (u.dst) u.dst->Release();
-    }
+    for (PendingUpload& u : todo) RecordUploadAndRetire(cl, u);
     logger::trace("PORT: flushed %zu queued upload(s) onto the command list", todo.size());
+}
+
+void FlushPendingUploadFor(ID3D12GraphicsCommandList* cl, ID3D11Resource* res)
+{
+    if (!cl || !res) return;
+    WrapResource* wr_fast = AsWrapResource(res);
+    if (!wr_fast || !wr_fast->dx12 || !wr_fast->has_pending_upload.load(std::memory_order_acquire)) return;
+    PROF(PL_UploadFlush);
+    const uint64_t recording = ListRecording(cl);
+    const bool want_redraw = g_present_redraw;
+    std::vector<PendingUpload> todo;
+    {
+        std::lock_guard<std::mutex> l(Mtx());
+        auto& up = Uploads();
+        size_t keep = 0;
+        bool still = false;
+        for (size_t i = 0; i < up.size(); ++i) {
+            if (up[i].dst == res && up[i].for_redraw == want_redraw) {
+                if (!up[i].for_redraw) wr_fast->flushed = { up[i].seq, cl, recording };
+                todo.push_back(std::move(up[i]));
+            } else {
+                if (up[i].dst == res) still = true;
+                if (keep != i) up[keep] = std::move(up[i]);
+                ++keep;
+            }
+        }
+        up.resize(keep);
+        if (!still) wr_fast->has_pending_upload.store(false, std::memory_order_release);
+    }
+    if (todo.empty()) return;
+    GpuBracket _gt(cl, GT_UploadFlush);
+    for (PendingUpload& u : todo) RecordUploadAndRetire(cl, u);
 }
 
 constexpr UINT kRingBlock = 256;
@@ -2607,6 +3110,7 @@ void RetireDx12Resource(ID3D12Resource* res)
 
 void UploadFrameTick()
 {
+    AsyncCopyDrainStaging();
     std::vector<ID3D12Resource*> gone;
     {
         std::lock_guard<std::mutex> l(g_retire_mtx);
@@ -2618,6 +3122,35 @@ void UploadFrameTick()
                 g_retired_res[keep++] = g_retired_res[i];
         }
         g_retired_res.resize(keep);
+    }
+    {
+        const uint64_t now = GetTickCount64();
+        std::lock_guard<std::mutex> l(Mtx());
+        auto& ret = RetiredStaging();
+        size_t rkeep = 0;
+        for (size_t i = 0; i < ret.size(); ++i) {
+            if (GpuPassed(ret[i].stamp)) {
+                if (ret[i].res) gone.push_back(ret[i].res);
+            } else {
+                ret[rkeep++] = ret[i];
+            }
+        }
+        ret.resize(rkeep);
+
+        auto& pool = StagingPool();
+        size_t pkeep = 0;
+        for (size_t i = 0; i < pool.entries.size(); ++i) {
+            const PooledEntry& e = pool.entries[i];
+            const bool done = (e.stamp == 0 || GpuPassed(e.stamp));
+            if (done && now - e.idle_since >= kStagingPoolIdleMs) {
+                pool.total_bytes = pool.total_bytes >= e.cap ? (pool.total_bytes - e.cap) : 0;
+                if (e.res) gone.push_back(e.res);
+            } else {
+                if (pkeep != i) pool.entries[pkeep] = e;
+                ++pkeep;
+            }
+        }
+        pool.entries.resize(pkeep);
     }
     for (ID3D12Resource* r : gone) r->Release();
 }

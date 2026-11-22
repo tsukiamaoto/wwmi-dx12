@@ -5,6 +5,7 @@
 #include "present_mod_load.h"
 #include "../build_stamp.h"
 #include "../textures/tex_place.h"
+#include "../textures/tex_defer.h"
 #include "../textures/mod_texture_store.h"
 #include "../migoto/port_api.h"
 #include "present_toggles.h"
@@ -50,6 +51,7 @@ void ModTexturesLoad::Tick()
 {
     if (started_) {
         BannerTick();
+        g_tex_defer.PublishCompleted();
         const size_t described = g_mod_textures.Resources().size();
         g_mod_textures.SubstantiateWclResources();
         if (g_mod_textures.Resources().size() > described) {

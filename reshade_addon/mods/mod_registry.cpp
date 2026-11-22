@@ -9,6 +9,7 @@
 #include "../draw/draw_toggles.h"
 #include "../migoto/port_api.h"
 #include <algorithm>
+#include <chrono>
 #include <cwctype>
 #include <filesystem>
 #include <map>
@@ -104,7 +105,8 @@ void ModRegistry::Build()
                 continue;
             }
             if (gm.mod.dir.empty()) gm.mod.dir = dm.dir; // only if their SectionFolder had none
-            WwmiMod::LoadResources(gm.mod, CurrentSet().held);
+            // .buf resources are substantiated lazily on first appearance (EnsureModBuffersLoaded) instead of
+            // synchronously reading every inactive character's meshes into VRAM at startup / F10 reload.
             if (!gm.mod.forward_map_file.empty()) {
                 std::wstring rel = gm.mod.forward_map_file;
                 for (auto& c : rel)
@@ -212,6 +214,18 @@ void ModRegistry::Build()
         }
     }
     if (!units_.empty()) Comps().Finalize();
+}
+
+void ModRegistry::EnsureModBuffersLoaded(int mod_id)
+{
+    if (mod_id < 0 || mod_id >= (int)units_.size()) return;
+    GeoMod& gm = units_[mod_id];
+    if (gm.buffers_loaded) return;
+    gm.buffers_loaded = true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int n = WwmiMod::LoadResources(gm.mod, CurrentSet().held);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    logger::write("MODBUF-LOAD mod=%d ns='%ls': adopted %d buffer(s) lazily in %.1f ms", mod_id, gm.wcl_ns.c_str(), n, ms);
 }
 
 std::vector<DiscoveredMod> ModRegistry::Discover()

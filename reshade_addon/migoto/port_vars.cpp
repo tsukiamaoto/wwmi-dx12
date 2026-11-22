@@ -255,7 +255,7 @@ void SetTextureDeferral(bool (*sink)(const DeferredTexture& t, void* user), void
     g_defer_sink.store(sink, std::memory_order_release);
 }
 
-void DeferTexture(CustomResource* r)
+void DeferTexture(CustomResource* r, bool low_priority)
 {
     const auto sink = g_defer_sink.load(std::memory_order_acquire);
     if (!sink || !r || r->substantiated || r->resource || r->view) return;
@@ -271,13 +271,27 @@ void DeferTexture(CustomResource* r)
     if (r->override_bind_flags != CustomResourceBindFlags::INVALID) bind = (D3D11_BIND_FLAG)r->override_bind_flags;
     D3D11_RESOURCE_MISC_FLAG misc = r->misc_flags;
     if (r->override_misc_flags != ResourceMiscFlags::INVALID) misc = (D3D11_RESOURCE_MISC_FLAG)r->override_misc_flags;
-    if (!sink({ n->second, fn, (unsigned)bind, (unsigned)misc, r->override_color_space == CustomColorSpace::SRGB },
+    if (!sink({ n->second, fn, (unsigned)bind, (unsigned)misc, r->override_color_space == CustomColorSpace::SRGB, 0u,
+                  low_priority },
             g_defer_user.load(std::memory_order_acquire)))
         return;
     r->substantiated = true; // Substantiate's first act, so the draw loads nothing itself
     r->bind_flags = bind;
     r->misc_flags = misc;
     g_deferred_pending[r] = g_generation;
+}
+
+bool PreloadDeferredTexture(const wchar_t* fq_name)
+{
+    if (!fq_name || !*fq_name) return false;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded) return false;
+    auto it = customResources.find(fq_name);
+    if (it == customResources.end()) return false;
+    CustomResource& r = it->second;
+    if (r.substantiated || r.resource || r.view) return false;
+    DeferTexture(&r, /*low_priority=*/true);
+    return r.substantiated;
 }
 
 bool DeferredPending(CustomResource* r)
@@ -326,9 +340,13 @@ void LoadDeferredNow(CustomResource* r)
         n != names.end() ? n->second.c_str() : r->filename.c_str());
 }
 
-ID3D11Resource* LoadDeferredTexture(const DeferredTexture& t)
+ID3D11Resource* LoadDeferredTexture(const DeferredTexture& t, bool async_copy, uint64_t* out_async_fence)
 {
+    if (out_async_fence) *out_async_fence = 0;
     EnsureCOM();
+    if (ID3D11Resource* direct = MigotoPort::TryLoadDdsDirectToUpload(
+            t.filename.c_str(), t.maxsize, t.bind_flags, t.misc_flags, t.force_srgb, async_copy, out_async_fence))
+        return direct;
     ID3D11Resource* res = nullptr;
     HRESULT hr = DirectX::CreateDDSTextureFromFileEx(g_dev.GetPassThroughOrigDevice1(), t.filename.c_str(), t.maxsize,
         D3D11_USAGE_DEFAULT, t.bind_flags, 0, t.misc_flags, t.force_srgb, &res, nullptr, nullptr);
