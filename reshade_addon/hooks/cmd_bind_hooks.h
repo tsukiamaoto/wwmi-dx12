@@ -36,6 +36,8 @@ void on_bind_descriptor_tables(reshade::api::command_list* cmd_list, reshade::ap
 void on_push_constants(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages,
     reshade::api::pipeline_layout layout, uint32_t layout_param, uint32_t first, uint32_t count, const void* values);
 ID3D12DescriptorHeap* GameHeap(reshade::api::command_list* cmd_list, int type);
+// Restore the exact descriptor heaps the game last set via SetDescriptorHeaps in this recording.
+void RestoreGameDescriptorHeaps(reshade::api::command_list* cmd_list);
 
 // Where a ResolveBound stopped (step 0 = resolved) and what it saw on the way; filled only when asked for.
 struct BindTrace {

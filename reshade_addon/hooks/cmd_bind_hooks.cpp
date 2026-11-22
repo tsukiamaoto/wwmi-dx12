@@ -409,6 +409,15 @@ ID3D12DescriptorHeap* GameHeap(command_list* cmd_list, int type)
     return hb.heap;
 }
 
+void RestoreGameDescriptorHeaps(command_list* cmd_list)
+{
+    if (!cmd_list) return;
+    // ReShade records the exact ID3D12GraphicsCommandList::SetDescriptorHeaps arguments on every recording
+    // (including before any descriptor table is bound). Calling bind_descriptor_tables with stages=0 and count=0
+    // re-emits _orig->SetDescriptorHeaps with the game's live heaps without touching any root signature.
+    cmd_list->bind_descriptor_tables(static_cast<shader_stage>(0), { 0 }, 0, 0, nullptr);
+}
+
 void on_bind_descriptor_tables(command_list* cmd_list, shader_stage stages, pipeline_layout layout, uint32_t first,
     uint32_t count, const descriptor_table* tables)
 {
@@ -422,11 +431,12 @@ void on_bind_descriptor_tables(command_list* cmd_list, shader_stage stages, pipe
         std::fill(std::begin(g.kind), std::end(g.kind), CmdGfxRoot::kNone);
         g.constant_count = 0;
         g.layout = layout.handle;
+        for (auto& rp : state.root) rp.table = { 0 };
     }
     for (uint32_t i = 0; i < n; ++i) {
         RootParam& rp = state.root[first + i];
-        rp.table = tables[i];
         if (!to_compute) {
+            rp.table = tables[i];
             g.kind[first + i] = CmdGfxRoot::kTable;
             g.value[first + i] = tables[i].handle;
         }

@@ -216,8 +216,6 @@ static void EnterSectionScopes(ComponentRun& run, SectionScopes& sc)
             if (t.kind == 0 && !port_restore.smp) port_restore.smp = hp;
             port_restore.tables.emplace_back((UINT)t.param, (uint64_t)root[t.param].table.handle);
         }
-        if (ID3D12DescriptorHeap* gh = GameHeap(cmd_list, 0)) port_restore.srv = gh;
-        if (ID3D12DescriptorHeap* gh = GameHeap(cmd_list, 1)) port_restore.smp = gh;
         port_restore.game = cmd_list;
         port_restore.cl = ctx.args.d3d12_cl;
         port_restore.ctx = &ctx;
@@ -232,12 +230,11 @@ static void EnterSectionScopes(ComponentRun& run, SectionScopes& sc)
                 auto* r = static_cast<PortRestore*>(u);
                 if (r->pso) r->cl->SetPipelineState(r->pso);
                 if (MigotoPort::TakeHeapsChanged()) {
-                    if (r->srv) {
+                    if (r->game) {
+                        RestoreGameDescriptorHeaps(r->game);
+                    } else if (r->srv) {
                         ID3D12DescriptorHeap* h[2] = { r->srv, r->smp };
                         r->cl->SetDescriptorHeaps(r->smp ? 2 : 1, h);
-                    } else if (g_debug && DiagOnce("HEAPRESTORE-NOSRV", 0)) {
-                        logger::write(
-                            "HEAPRESTORE: our heaps were set on this list and the game's CBV_SRV_UAV heap is unknown -- ours stay set");
                     }
                 }
                 const bool root = MigotoPort::g_touched_root_sig && RestoreGameRoot(r->game, r->cl);

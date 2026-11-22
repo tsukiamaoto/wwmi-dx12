@@ -62,17 +62,21 @@ void RestoreOverrideDraw(void* user)
     ID3D12GraphicsCommandList* const cl = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
     const CmdState& gs = g_command_lists.Gfx(cmd_list);
     if (const uint64_t pso = gs.gfx_restore()) cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(pso));
-    if (MigotoPort::TakeHeapsChanged()) {
-        ID3D12DescriptorHeap* h[2] = { GameHeap(cmd_list, 0), GameHeap(cmd_list, 1) };
-        if (h[0])
-            cl->SetDescriptorHeaps(h[1] ? 2 : 1, h);
-        else if (g_debug && DiagOnce("HEAPRESTORE-NOSRV", 1))
-            logger::write(
-                "HEAPRESTORE: our heaps were set on this list and the game's CBV_SRV_UAV heap is unknown -- ours stay set");
+    const bool heaps_changed = MigotoPort::TakeHeapsChanged();
+    if (heaps_changed) {
+        RestoreGameDescriptorHeaps(cmd_list);
     }
     if (MigotoPort::g_touched_root_sig) {
         RestoreGameRoot(cmd_list, cl);
         MigotoPort::g_touched_root_sig = false;
+    } else if (heaps_changed) {
+        // SetDescriptorHeaps invalidates all graphics root descriptor tables on this list.
+        const CmdGfxRoot& g = g_command_lists.GfxRoot(cmd_list);
+        if (g.layout) {
+            for (UINT p = 0; p < 64; ++p)
+                if (g.kind[p] == CmdGfxRoot::kTable && g.value[p])
+                    cl->SetGraphicsRootDescriptorTable(p, D3D12_GPU_DESCRIPTOR_HANDLE{ g.value[p] });
+        }
     }
     if (MigotoPort::g_touched_rt) {
         const CmdRT& rt = g_command_lists.Rt(cmd_list);
