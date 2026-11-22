@@ -3,8 +3,10 @@
 #include <reshade.hpp>
 #include <wrl.h>
 #include <atomic>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 // The mod textures the host has loaded: an SRV for each in our own heap, the resource, the file it came from, and
@@ -52,6 +54,10 @@ public:
     // entry taken out again (key gone, index dead, its SRV slot handed back for SrvFree once nothing can be copying it).
     int Describe(ID3D12Resource* res, const wchar_t* name);
     bool Forget(ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE* srv, unsigned* epoch); // epoch: SrvEpoch() then
+    // Any thread (on_destroy_resource): synchronously drop a destroyed pointer before its address can be recycled.
+    bool ForgetOnDestroy(ID3D12Resource* res);
+    // Present thread: mark entries dropped by ForgetOnDestroy invalid in resources_ and hand back their SRV slots.
+    void DrainDestroyed(std::vector<std::pair<D3D12_CPU_DESCRIPTOR_HANDLE, unsigned>>& out);
     unsigned SrvEpoch() const { return srv_epoch_; }
     void SrvFree(D3D12_CPU_DESCRIPTOR_HANDLE srv, unsigned epoch);
 
@@ -92,6 +98,13 @@ private:
     std::vector<Resource> resources_;
     mutable std::shared_mutex names_mutex_;
     std::vector<std::wstring> names_; // resources_' paths, for readers on other threads
+    struct DeadEntry {
+        uint32_t index;
+        D3D12_CPU_DESCRIPTOR_HANDLE srv;
+        unsigned epoch;
+    };
+    std::mutex mutate_mtx_; // serializes table_ growth/clear/drop against ForgetOnDestroy; never taken by lock-free readers
+    std::vector<DeadEntry> dead_; // under mutate_mtx_: drained on the present thread
     std::atomic<Table*> table_{ nullptr };
     std::atomic<uint32_t> count_{ 0 };
     std::atomic<unsigned> gen_{ 1 };

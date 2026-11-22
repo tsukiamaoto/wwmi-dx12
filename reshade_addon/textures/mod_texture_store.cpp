@@ -139,6 +139,8 @@ void ModTextureStore::AllocTable(uint32_t cap)
 
 void ModTextureStore::ClearTable()
 {
+    std::lock_guard<std::mutex> l(mutate_mtx_);
+    dead_.clear();
     gen_.fetch_add(1, std::memory_order_acq_rel);
     count_.store(0, std::memory_order_release);
     bytes_.store(0, std::memory_order_release);
@@ -154,6 +156,7 @@ void ModTextureStore::ClearTable()
 
 void ModTextureStore::Publish(uint32_t index, const Entry& e, uint64_t bytes)
 {
+    std::lock_guard<std::mutex> l(mutate_mtx_);
     Table* s = table_.load(std::memory_order_acquire);
     if (!s || !e.res) return;
     if (index >= s->cap) {
@@ -280,22 +283,62 @@ ID3D12Resource* ModTextureStore::ResOfSrv(D3D12_CPU_DESCRIPTOR_HANDLE srv) const
 
 bool ModTextureStore::Forget(ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE* srv, unsigned* epoch)
 {
-    Table* s = table_.load(std::memory_order_acquire);
-    const int index = IndexOf(res);
-    if (!s || index < 0) return false;
-    Entry& e = s->entries[index];
-    if (srv) *srv = e.srv;
-    if (epoch) *epoch = s->srv_epoch[index];
-    bytes_.fetch_sub((std::min)(s->bytes[index], bytes_.load(std::memory_order_acquire)), std::memory_order_acq_rel);
-    s->bytes[index] = 0;
-    s->drop_key((uint64_t)res);
-    std::atomic_ref<ID3D12Resource*>(e.res).store(nullptr, std::memory_order_release);
+    int index = -1;
+    {
+        std::lock_guard<std::mutex> l(mutate_mtx_);
+        Table* s = table_.load(std::memory_order_acquire);
+        index = IndexOf(res);
+        if (!s || index < 0) return false;
+        Entry& e = s->entries[index];
+        if (srv) *srv = e.srv;
+        if (epoch) *epoch = s->srv_epoch[index];
+        bytes_.fetch_sub((std::min)(s->bytes[index], bytes_.load(std::memory_order_acquire)), std::memory_order_acq_rel);
+        s->bytes[index] = 0;
+        s->drop_key((uint64_t)res);
+        std::atomic_ref<ID3D12Resource*>(e.res).store(nullptr, std::memory_order_release);
+        gen_.fetch_add(1, std::memory_order_acq_rel);
+    }
     if ((size_t)index < resources_.size()) {
         resources_[index].valid = false;
         resources_[index].res = nullptr;
     }
+    return true;
+}
+
+bool ModTextureStore::ForgetOnDestroy(ID3D12Resource* res)
+{
+    if (!res || IndexOf(res) < 0) return false; // lock-free fast path
+    std::lock_guard<std::mutex> l(mutate_mtx_);
+    Table* s = table_.load(std::memory_order_acquire);
+    const int index = IndexOf(res);
+    if (!s || index < 0) return false;
+    Entry& e = s->entries[index];
+    const D3D12_CPU_DESCRIPTOR_HANDLE srv = e.srv;
+    const unsigned epoch = s->srv_epoch[index];
+    bytes_.fetch_sub((std::min)(s->bytes[index], bytes_.load(std::memory_order_acquire)), std::memory_order_acq_rel);
+    s->bytes[index] = 0;
+    s->drop_key((uint64_t)res);
+    std::atomic_ref<ID3D12Resource*>(e.res).store(nullptr, std::memory_order_release);
+    dead_.push_back({ (uint32_t)index, srv, epoch });
     gen_.fetch_add(1, std::memory_order_acq_rel);
     return true;
+}
+
+void ModTextureStore::DrainDestroyed(std::vector<std::pair<D3D12_CPU_DESCRIPTOR_HANDLE, unsigned>>& out)
+{
+    std::vector<DeadEntry> items;
+    {
+        std::lock_guard<std::mutex> l(mutate_mtx_);
+        if (dead_.empty()) return;
+        items.swap(dead_);
+    }
+    for (const DeadEntry& d : items) {
+        if (d.index < resources_.size()) {
+            resources_[d.index].valid = false;
+            resources_[d.index].res = nullptr;
+        }
+        if (d.srv.ptr) out.push_back({ d.srv, d.epoch });
+    }
 }
 
 void ModTextureStore::SrvFree(D3D12_CPU_DESCRIPTOR_HANDLE srv, unsigned epoch)
@@ -440,7 +483,8 @@ bool ModTextureStore::SubstantiateWclResources()
             if (c->store->DescribeTexture(c->dev, dx12, filename && *filename ? filename : fq_name) >= 0)
                 ++*c->registered;
         },
-        &ctx, [](ID3D12Resource* dx12, void* user) { return dx12 && ((Ctx*)user)->store->IndexOf(dx12) < 0; });
+        &ctx, [](ID3D12Resource* dx12, void* user) { return dx12 && ((Ctx*)user)->store->IndexOf(dx12) < 0; },
+        /*skip_foreign=*/true);
 
     if (registered > 0)
         logger::write("PortRes: described %d newly substantiated texture(s); %zu total, %u SRV slots used", registered,

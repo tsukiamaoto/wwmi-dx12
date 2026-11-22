@@ -12,6 +12,7 @@
 #include "tex_lineage.h"
 #include "tex_crawl.h"
 #include "tex_dhash_table.h"
+#include "mod_texture_store.h"
 #include "../mods/ib_hash.h" // ForgetRange: a whole-buffer copy replaces the mesh hashes inside it
 #include "../mods/mod_set.h"
 #include "../instrumentation/removal_pin.h"
@@ -26,6 +27,9 @@ using namespace reshade::api;
 
 void TexOnDestroyed(uint64_t res)
 {
+    if (g_mod_textures.ForgetOnDestroy(reinterpret_cast<ID3D12Resource*>(res)) && g_debug)
+        logger::write("TEXSTORE: resource %p destroyed while still in store -- dropped synchronously",
+            reinterpret_cast<void*>(res));
     g_tex_identity.Forget(res);
     g_tex_mip_identity.Forget(res);
     g_tex_place.ForgetMissed(res);

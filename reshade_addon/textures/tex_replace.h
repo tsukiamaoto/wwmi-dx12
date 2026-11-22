@@ -52,6 +52,7 @@ public:
     bool Halved() const { return halved_any_.load(std::memory_order_acquire); }
     bool HalfSize(const std::wstring& fq_name) const { return halved_.count(fq_name) != 0; } // present thread
     void Tick(ID3D12CommandQueue* queue); // present thread, after ModTexturesTick
+    void SweepDying(); // present thread: forget retired/destroyed textures BEFORE UploadFrameTick releases them
     void ClearForParse(); // present thread, at a parse's set build: every texture out of the store, its slot quarantined
     void Stop();
     ~TexReplace()
@@ -105,7 +106,6 @@ private:
     };
     static void OnRetire(ID3D12Resource* res);
     void Run();
-    void SweepDying();
     void StartPass(Pass p);
     void Queue(std::vector<Job>& jobs);
     void SubmitEncodes(ID3D12CommandQueue* queue);

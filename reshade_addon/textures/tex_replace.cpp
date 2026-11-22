@@ -100,6 +100,15 @@ void TexReplace::ClearForParse()
 
 void TexReplace::SweepDying()
 {
+    if (!observing_) {
+        MigotoPort::SetRetireObserver(&TexReplace::OnRetire);
+        observing_ = true;
+    }
+    {
+        std::vector<std::pair<D3D12_CPU_DESCRIPTOR_HANDLE, unsigned>> dead_srvs;
+        g_mod_textures.DrainDestroyed(dead_srvs);
+        for (const auto& [srv, epoch] : dead_srvs) Quarantine(srv, epoch);
+    }
     std::unordered_set<ID3D12Resource*> dying;
     {
         std::lock_guard l(dying_mtx_);
