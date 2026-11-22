@@ -1,5 +1,6 @@
 // The replay: one mod instance's queued lists, run on its first draw of the frame. See sk_internal.h.
 #include "sk_internal.h"
+#include "../core/d3d12_barrier.h"
 #include "../mods/mod_set.h"
 #include "../instrumentation/sk_ring.h"
 #include "../instrumentation/morph_dump.h"
@@ -483,18 +484,76 @@ void ShapekeyReplay::RunPasses(
         return;
     }
 
-    if (g_sk_toggles.u0_clear)
-        dr.u0_clear = store_.ZeroBinding(ns, inst, TargetClass::UnorderedAccessView, 0, cmd_list, "U0CLEAR");
-    if (g_sk_toggles.u1_clear)
-        dr.u1_clear = store_.ZeroBinding(ns, inst, TargetClass::UnorderedAccessView, 1, cmd_list, "U1CLEAR");
+    ID3D12GraphicsCommandList* const d3d12_cl =
+        cmd_list ? reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()) : nullptr;
+    ID3D12Resource* u1_res = nullptr;
+    {
+        SkBufferBinding b1b{};
+        if (store_.GetBinding(ns, inst, TargetClass::UnorderedAccessView, 1, &b1b)) u1_res = b1b.res;
+    }
+    auto foreign_pre_state = [&](ID3D12Resource* res) -> D3D12_RESOURCE_STATES {
+        const uint32_t obs = g_resources.StateOf(res);
+        const bool valid_d3d = (obs != MigotoPort::kResStateUnknown && (obs & 0xF0000000u) == 0);
+        if (res == inst) {
+            if (valid_d3d && (obs & D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER))
+                return static_cast<D3D12_RESOURCE_STATES>(obs);
+            return D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        }
+        if (obs == kTrackedCommon) return D3D12_RESOURCE_STATE_COMMON;
+        if (valid_d3d) return static_cast<D3D12_RESOURCE_STATES>(obs);
+        return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    };
 
+    const bool u0_init_foreign = u0_res && !MigotoPort::OwnedBuffer(u0_res);
+    D3D12_RESOURCE_STATES u0_orig_state =
+        u0_init_foreign ? foreign_pre_state(u0_res) : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    const bool u1_foreign = u1_res && u1_res != u0_res && !MigotoPort::OwnedBuffer(u1_res);
+    const D3D12_RESOURCE_STATES u1_orig_state =
+        u1_foreign ? foreign_pre_state(u1_res) : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+    if (g_sk_toggles.u0_clear)
+        dr.u0_clear = store_.ZeroBinding(
+            ns, inst, TargetClass::UnorderedAccessView, 0, cmd_list, "U0CLEAR", u0_orig_state);
+    if (g_sk_toggles.u1_clear)
+        dr.u1_clear = store_.ZeroBinding(
+            ns, inst, TargetClass::UnorderedAccessView, 1, cmd_list, "U1CLEAR", u1_orig_state);
+
+    ID3D12Resource* const u0_before_fallback = u0_res;
     OwnBufFallback(ns, mod_id, lists.front().u0hash, u0_res, u0_bytes);
+
+    const bool u0_foreign = u0_res && !MigotoPort::OwnedBuffer(u0_res);
+    const bool u0_cleared_to_uav = (u0_res == u0_before_fallback) && (dr.u0_clear == 1) && g_sk_toggles.clear_barrier;
+    if (u0_foreign && u0_res != u0_before_fallback) u0_orig_state = foreign_pre_state(u0_res);
+    const bool u1_cleared_to_uav = (dr.u1_clear == 1) && g_sk_toggles.clear_barrier;
+
+    if (d3d12_cl) {
+        if (u0_foreign && !u0_cleared_to_uav && u0_orig_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+            TransitionBarrier(d3d12_cl, u0_res, u0_orig_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g_resources.NoteState(reinterpret_cast<uint64_t>(u0_res), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        if (u1_foreign && !u1_cleared_to_uav && u1_orig_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+            TransitionBarrier(d3d12_cl, u1_res, u1_orig_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g_resources.NoteState(reinterpret_cast<uint64_t>(u1_res), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+    }
 
     RepublishBindings(ns, inst, mod_id, u0_res, u0_bytes);
 
     ReplayComputeState(ns, inst, mod_id);
 
     RunLists(ns, inst, mod_id, cmd_list, lists, dr, u0_res, u0_bytes);
+
+    if (d3d12_cl && (u0_foreign || u1_foreign)) {
+        MigotoPort::FlushUavBarriers(d3d12_cl);
+        if (u0_foreign && u0_orig_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+            TransitionBarrier(d3d12_cl, u0_res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, u0_orig_state);
+            g_resources.NoteState(reinterpret_cast<uint64_t>(u0_res), u0_orig_state);
+        }
+        if (u1_foreign && u1_orig_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+            TransitionBarrier(d3d12_cl, u1_res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, u1_orig_state);
+            g_resources.NoteState(reinterpret_cast<uint64_t>(u1_res), u1_orig_state);
+        }
+    }
 
     ReportDrain(ns, mod_id, lists, dr, left_for_others, dropped_unowned, u0_res, u0_bytes);
 }

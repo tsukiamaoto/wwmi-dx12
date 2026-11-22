@@ -4,6 +4,7 @@
 #include "../instrumentation/removal_pin.h"
 #include "../migoto/dx12_pipeline.h"
 #include "../core/gpu_progress.h"
+#include "../core/d3d12_barrier.h"
 #include "../core/d3d12_name.h"
 #include <cwctype>
 
@@ -103,7 +104,7 @@ static ID3D12Resource* SkMakeZeroSource(reshade::api::device* dev, unsigned byte
 }
 
 uint8_t ShapekeyStore::ZeroBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass kind, unsigned reg,
-    reshade::api::command_list* cmd_list, const char* why)
+    reshade::api::command_list* cmd_list, const char* why, D3D12_RESOURCE_STATES foreign_before)
 {
     const unsigned i = RegisterIndex(kind, reg);
     if (i == kNoRegister) return 0;
@@ -168,17 +169,20 @@ uint8_t ShapekeyStore::ZeroBinding(const std::wstring& ns, ID3D12Resource* inst,
         const resource dst{ reinterpret_cast<uint64_t>(b.res) };
         const resource zsrc{ reinterpret_cast<uint64_t>(src) };
         const bool owned = MigotoPort::OwnedBuffer(b.res);
+        ID3D12GraphicsCommandList* const d3d12_cl =
+            reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
         if (owned)
-            MigotoPort::OwnedTransition(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()), b.res,
-                D3D12_RESOURCE_STATE_COPY_DEST);
-        else if (g_sk_toggles.clear_barrier)
-            cmd_list->barrier(dst, resource_usage::unordered_access, resource_usage::copy_dest);
+            MigotoPort::OwnedTransition(d3d12_cl, b.res, D3D12_RESOURCE_STATE_COPY_DEST);
+        else if (g_sk_toggles.clear_barrier && foreign_before != D3D12_RESOURCE_STATE_COPY_DEST)
+            TransitionBarrier(d3d12_cl, b.res, foreign_before, D3D12_RESOURCE_STATE_COPY_DEST);
         cmd_list->copy_buffer_region(zsrc, 0, dst, 0, b.bytes);
         ProfGpuWork(PGW_SkCopy, b.bytes);
-        if (!owned && g_sk_toggles.clear_barrier)
-            cmd_list->barrier(dst, resource_usage::copy_dest, resource_usage::unordered_access);
-        RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "sk-clear");
-        RemovalPin::Refs(reinterpret_cast<const void*>(cmd_list->get_native()), b.res, "sk-clear destination");
+        if (!owned && g_sk_toggles.clear_barrier) {
+            TransitionBarrier(d3d12_cl, b.res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g_resources.NoteState(reinterpret_cast<uint64_t>(b.res), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        RemovalPin::Ours(reinterpret_cast<const void*>(d3d12_cl), "sk-clear");
+        RemovalPin::Refs(reinterpret_cast<const void*>(d3d12_cl), b.res, "sk-clear destination");
     }
     if (g_debug && LogBudget(why, ns, 6))
         logger::write("%s: zeroed %u B of %c%u (identity %u B, hash %08x, DECLARED) for ns='%ls' -- the "

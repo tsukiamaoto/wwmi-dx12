@@ -78,7 +78,8 @@ class ShapekeyStore {
 public:
     bool GetBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass kind, unsigned reg, SkBufferBinding* out);
     uint8_t ZeroBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass kind, unsigned reg,
-        reshade::api::command_list* cmd_list, const char* why);
+        reshade::api::command_list* cmd_list, const char* why,
+        D3D12_RESOURCE_STATES foreign_before = D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     void ZeroStats(TargetClass kind, unsigned reg, unsigned long long* cleared, unsigned long long* not_ours,
         unsigned long long* not_ready);
     bool SetSnap(const std::wstring& ns, ID3D12Resource* inst, unsigned reg, unsigned long long cs, unsigned tgy,
