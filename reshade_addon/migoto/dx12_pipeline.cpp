@@ -19,6 +19,7 @@
 #include "../instrumentation/gpu_timer.h" // GPU ms of what this file records (performance monitor)
 #include "../core/d3d12_buffer.h"
 #include "../core/d3d12_barrier.h"
+#include "../core/d3d12_name.h"
 #include "prof_core.h" // PROF(PL_*), ProfGpuWork: IssueDraw/IssueDispatch and the upload path
 #include "dx12_pipeline_internal.h"
 #include "dx12_skcap.h"
@@ -129,6 +130,16 @@ bool MakeHeap(Heap& h, ID3D12Device* dev, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT 
     d.NumDescriptors = count;
     d.Flags = shader_visible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     if (FAILED(dev->CreateDescriptorHeap(&d, IID_PPV_ARGS(&h.heap)))) return false;
+    const wchar_t* name = L"wwmi port heap";
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        name = shader_visible ? L"wwmi port ring heap" : L"wwmi port staging heap";
+    else if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+        name = shader_visible ? L"wwmi port sampler ring heap" : L"wwmi port sampler staging heap";
+    else if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+        name = L"wwmi port rtv heap";
+    else if (type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
+        name = L"wwmi port dsv heap";
+    DevName(h.heap, name);
     h.inc = dev->GetDescriptorHandleIncrementSize(type);
     h.size = count;
     h.next = 0;
@@ -374,6 +385,7 @@ static bool Promotable(const WrapResource* r, D3D12_RESOURCE_STATES to)
 using ListBufStates = std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>>;
 std::mutex g_list_buf_mtx;
 std::unordered_set<ID3D12Resource*> g_owned_bufs;
+std::unordered_set<ID3D12Resource*> g_owned_texs;
 std::unordered_map<ID3D12GraphicsCommandList*, ListBufStates> g_list_buf;
 std::unordered_map<ID3D12Resource*, uint64_t> g_owned_writes;
 std::unordered_map<ID3D12GraphicsCommandList*, uint64_t> g_list_recording;
@@ -522,6 +534,69 @@ ListBufChange SwapListBufState(ID3D12GraphicsCommandList* cl, ID3D12Resource* re
     return c;
 }
 
+bool TextureRead(D3D12_RESOURCE_STATES s)
+{
+    constexpr D3D12_RESOURCE_STATES kTexRead = D3D12_RESOURCE_STATE_COPY_SOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    return s != D3D12_RESOURCE_STATE_COMMON && (s & ~kTexRead) == 0;
+}
+
+struct ListTexChange {
+    D3D12_RESOURCE_STATES was = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES now = D3D12_RESOURCE_STATE_COMMON;
+
+    static D3D12_RESOURCE_STATES Next(D3D12_RESOURCE_STATES was, D3D12_RESOURCE_STATES to)
+    {
+        if (was == to) return was;
+        if (TextureRead(was) && TextureRead(to)) {
+            if ((was & to) == to) return was;
+            return was | to;
+        }
+        return to;
+    }
+
+    bool Record(ID3D12GraphicsCommandList* cl, ID3D12Resource* res, D3D12_RESOURCE_STATES to) const
+    {
+        if (now == was) {
+            if (now != to) ProfGpuWork(PGW_ReadKept, 0);
+            return false;
+        }
+        // Emit explicit transitions even from COMMON so textures never rely on implicit promotion across lists/queues.
+        TransitionBarrier(cl, res, was, now);
+        ProfGpuWork(PGW_Barrier, 0);
+        RemovalPin::Ours(cl, "port-transition");
+        return true;
+    }
+};
+
+ListTexChange SwapListTexState(ID3D12GraphicsCommandList* cl, ID3D12Resource* res, D3D12_RESOURCE_STATES to)
+{
+    std::lock_guard<std::mutex> l(g_list_buf_mtx);
+    ListBufStates& ls = g_list_buf[cl];
+    ListTexChange c;
+    for (auto& e : ls)
+        if (e.first == res) {
+            c.was = e.second;
+            c.now = ListTexChange::Next(c.was, to);
+            e.second = c.now;
+            return c;
+        }
+    c.now = ListTexChange::Next(D3D12_RESOURCE_STATE_COMMON, to);
+    if (c.now != D3D12_RESOURCE_STATE_COMMON) ls.emplace_back(res, c.now);
+    return c;
+}
+
+D3D12_RESOURCE_STATES OwnedTextureTransition(
+    ID3D12GraphicsCommandList* cl, ID3D12Resource* res, D3D12_RESOURCE_STATES to)
+{
+    if (!cl || !res) return D3D12_RESOURCE_STATE_COMMON;
+    const bool owed = g_owed_uav.Take(cl, res);
+    const ListTexChange c = SwapListTexState(cl, res, to);
+    const bool transitioned = c.Record(cl, res, to);
+    if (owed) g_owed_uav.Pay(cl, res, transitioned);
+    return c.was;
+}
+
 bool StateBarrier(ID3D12GraphicsCommandList* cl, WrapResource* r, D3D12_RESOURCE_STATES to)
 {
     if (r->foreign) {
@@ -552,6 +627,11 @@ void Transition(ID3D12GraphicsCommandList* cl, WrapResource* r, D3D12_RESOURCE_S
     if (r->dim == D3D11_RESOURCE_DIMENSION_BUFFER && OwnedBuffer(r->dx12)) {
         OwnedTransition(cl, r->dx12, to);
         r->state = to;
+        return;
+    }
+
+    if (OwnedTexture(r->dx12)) {
+        OwnedTextureTransition(cl, r->dx12, to);
         return;
     }
 
@@ -661,6 +741,7 @@ struct PendingUpload {
     ID3D12Resource* staging = nullptr; // a private staging buffer, or the ring (from_ring)
     bool is_texture = false;
     bool from_ring = false; // source is the upload ring: nothing to retire or release
+    bool for_redraw = false; // queued during PresentRedraw: flushed only on the redraw list
     UINT subresources = 1;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts; // ABSOLUTE offsets into `staging`
     UINT64 src_offset = 0; // buffer uploads: where in `staging` the bytes start
@@ -848,11 +929,19 @@ void OwnBuffer(ID3D12Resource* res)
     g_owned_bufs.insert(res);
 }
 
+void OwnTexture(ID3D12Resource* res)
+{
+    if (!res) return;
+    std::lock_guard<std::mutex> l(g_list_buf_mtx);
+    g_owned_texs.insert(res);
+}
+
 void DisownBuffer(ID3D12Resource* res)
 {
     if (!res) return;
     std::lock_guard<std::mutex> l(g_list_buf_mtx);
     g_owned_bufs.erase(res);
+    g_owned_texs.erase(res);
     g_owned_writes.erase(res);
 }
 
@@ -861,6 +950,13 @@ bool OwnedBuffer(ID3D12Resource* res)
     if (!res) return false;
     std::lock_guard<std::mutex> l(g_list_buf_mtx);
     return g_owned_bufs.count(res) != 0;
+}
+
+bool OwnedTexture(ID3D12Resource* res)
+{
+    if (!res) return false;
+    std::lock_guard<std::mutex> l(g_list_buf_mtx);
+    return g_owned_texs.count(res) != 0;
 }
 
 D3D12_RESOURCE_STATES OwnedTransition(ID3D12GraphicsCommandList* cl, ID3D12Resource* res, D3D12_RESOURCE_STATES to)
@@ -880,7 +976,9 @@ D3D12_RESOURCE_STATES OwnedTransition(ID3D12GraphicsCommandList* cl, ID3D12Resou
 D3D12_RESOURCE_STATES ListStateOf(ID3D12GraphicsCommandList* cl, WrapResource* r)
 {
     if (!r) return D3D12_RESOURCE_STATE_COMMON;
-    if (!cl || !r->dx12 || r->dim != D3D11_RESOURCE_DIMENSION_BUFFER || !OwnedBuffer(r->dx12)) return r->state;
+    const bool tracked = cl && r->dx12 &&
+        ((r->dim == D3D11_RESOURCE_DIMENSION_BUFFER && OwnedBuffer(r->dx12)) || OwnedTexture(r->dx12));
+    if (!tracked) return r->state;
     std::lock_guard<std::mutex> l(g_list_buf_mtx);
     auto it = g_list_buf.find(cl);
     if (it == g_list_buf.end()) return D3D12_RESOURCE_STATE_COMMON;
@@ -1103,9 +1201,10 @@ void QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t s
     }
     u.dst = dst;
     u.seq = seq;
+    u.for_redraw = g_present_redraw;
     dst->AddRef();
     std::lock_guard<std::mutex> l(Mtx());
-    wr->queued_seq = seq;
+    if (!u.for_redraw) wr->queued_seq = seq;
     Uploads().push_back(std::move(u));
 }
 
@@ -1132,11 +1231,12 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
     UINT64 total = 0;
     b.device->GetCopyableFootprints(&rd, 0, subresources, 0, layouts.data(), rows.data(), row_bytes.data(), &total);
 
+    const bool for_redraw = g_present_redraw;
     if (subresources == 1 && data[0].pSysMem) {
         std::lock_guard<std::mutex> l(Mtx());
         for (auto it = Uploads().rbegin(); it != Uploads().rend(); ++it) {
             if (it->dst != dst || !it->is_texture || !it->from_ring || it->subresources != 1 ||
-                it->staging != Ring().res)
+                it->staging != Ring().res || it->for_redraw != for_redraw)
                 continue;
             uint8_t* dst_rows = Ring().mapped + it->layouts[0].Offset;
             const uint8_t* src_rows = (const uint8_t*)data[0].pSysMem;
@@ -1144,7 +1244,7 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
                 memcpy(dst_rows + (size_t)y * it->layouts[0].Footprint.RowPitch,
                     src_rows + (size_t)y * data[0].SysMemPitch, (size_t)row_bytes[0]);
             it->seq = seq;
-            wr->queued_seq = seq;
+            if (!for_redraw) wr->queued_seq = seq;
             ProfGpuWork(PGW_UploadDedup, 0);
             return;
         }
@@ -1191,6 +1291,7 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
     dst->AddRef();
     u.staging = staging;
     u.from_ring = ring;
+    u.for_redraw = for_redraw;
     u.is_texture = true;
     u.subresources = subresources;
     u.layouts = std::move(layouts);
@@ -1198,7 +1299,7 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
     u.queued_stamp = GpuStamp();
     u.seq = seq;
     std::lock_guard<std::mutex> l(Mtx());
-    wr->queued_seq = seq;
+    if (!for_redraw) wr->queued_seq = seq;
     Uploads().push_back(std::move(u));
 }
 
@@ -1217,28 +1318,61 @@ bool ListHoldsUpload(ID3D12GraphicsCommandList* cl, const WrapResource* wr)
         wr->flushed.recording == recording;
 }
 
+void DiscardRedrawUploads()
+{
+    std::vector<ID3D11Resource*> release_dst;
+    {
+        std::lock_guard<std::mutex> l(Mtx());
+        auto& up = Uploads();
+        size_t keep = 0;
+        for (size_t i = 0; i < up.size(); ++i) {
+            if (up[i].for_redraw) {
+                if (!up[i].from_ring && up[i].staging) RetiredStaging().push_back({ up[i].staging, GpuStamp() });
+                if (up[i].dst) release_dst.push_back(up[i].dst);
+            } else {
+                if (keep != i) up[keep] = std::move(up[i]);
+                ++keep;
+            }
+        }
+        up.resize(keep);
+    }
+    for (ID3D11Resource* d : release_dst) d->Release();
+}
+
 void FlushPendingUploads(ID3D12GraphicsCommandList* cl)
 {
     if (!cl) return;
     PROF(PL_UploadFlush);
     const uint64_t recording = ListRecording(cl);
+    const bool want_redraw = g_present_redraw;
     std::vector<PendingUpload> todo;
     {
         std::lock_guard<std::mutex> l(Mtx());
-        if (Uploads().empty()) return;
-        todo.swap(Uploads());
-        for (const PendingUpload& u : todo)
-            if (WrapResource* wr = AsWrapResource(u.dst)) wr->flushed = { u.seq, cl, recording };
+        auto& up = Uploads();
+        if (up.empty()) return;
+        size_t keep = 0;
+        for (size_t i = 0; i < up.size(); ++i) {
+            if (up[i].for_redraw == want_redraw) {
+                if (!up[i].for_redraw)
+                    if (WrapResource* wr = AsWrapResource(up[i].dst)) wr->flushed = { up[i].seq, cl, recording };
+                todo.push_back(std::move(up[i]));
+            } else {
+                if (keep != i) up[keep] = std::move(up[i]);
+                ++keep;
+            }
+        }
+        up.resize(keep);
+        if (todo.empty()) return;
         // Release only what the GPU is demonstrably done with, instead of everything queued last time.
         auto& ret = RetiredStaging();
-        size_t keep = 0;
+        size_t rkeep = 0;
         for (size_t i = 0; i < ret.size(); ++i) {
             if (GpuPassed(ret[i].stamp)) {
                 if (ret[i].res) ret[i].res->Release();
             } else
-                ret[keep++] = ret[i];
+                ret[rkeep++] = ret[i];
         }
-        ret.resize(keep);
+        ret.resize(rkeep);
     }
     GpuBracket _gt(cl, GT_UploadFlush);
     for (PendingUpload& u : todo) {

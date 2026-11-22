@@ -848,21 +848,24 @@ void STDMETHODCALLTYPE Dx12Context::Unmap(ID3D11Resource* pResource, UINT)
 {
     WrapResource* wr = AsWrapResource(pResource);
     if (wr && wr->dx12 && !wr->shadow.empty()) {
-        if (wr->uploaded.size() == wr->shadow.size() &&
+        if (!g_present_redraw && wr->uploaded.size() == wr->shadow.size() &&
             memcmp(wr->uploaded.data(), wr->shadow.data(), wr->shadow.size()) == 0 &&
             ListHoldsUpload(GetDx12Bridge().cl, wr))
             return;
-        wr->uploaded = wr->shadow;
-        wr->uploaded_seq = NextUploadSeq();
+        const uint64_t seq = NextUploadSeq();
+        if (!g_present_redraw) {
+            wr->uploaded = wr->shadow;
+            wr->uploaded_seq = seq;
+        }
 
         const D3D12_RESOURCE_DESC rd = wr->dx12->GetDesc();
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            QueueUpload(pResource, wr->shadow.data(), wr->shadow.size(), wr->uploaded_seq);
+            QueueUpload(pResource, wr->shadow.data(), wr->shadow.size(), seq);
         } else {
             D3D11_SUBRESOURCE_DATA sd{};
             sd.pSysMem = wr->shadow.data();
             sd.SysMemPitch = (UINT)(wr->shadow.size() / (rd.Height ? rd.Height : 1)); // Map laid rows out at Width*bpp
-            QueueTextureUpload(pResource, &sd, 1, wr->uploaded_seq);
+            QueueTextureUpload(pResource, &sd, 1, seq);
         }
         return;
     }

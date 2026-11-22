@@ -160,6 +160,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture1D(const D3D11_TEXTURE1D_DESC
         return E_FAIL;
     }
     DevName(res, L"wwmi mod texture");
+    OwnTexture(res);
 
     WrapTexture1D* w = new WrapTexture1D();
     w->dx12 = res;
@@ -278,12 +279,12 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC
         return E_FAIL;
     }
     DevName(res, L"wwmi mod texture");
+    OwnTexture(res);
     if (timed) QueryPerformanceCounter(&t1);
 
     {
-        static int n = 0;
-        if (n < 64) {
-            ++n;
+        static std::atomic<int> n{ 0 };
+        if (n.fetch_add(1, std::memory_order_relaxed) < 64) {
             logger::write("PORT-TEX %ux%u mips=%u array=%u fmt=%d bind=%x -> dx12 res=%p mips=%u array=%u",
                 pDesc->Width, pDesc->Height, pDesc->MipLevels, pDesc->ArraySize, (int)pDesc->Format, pDesc->BindFlags,
                 (void*)res, (unsigned)res->GetDesc().MipLevels, (unsigned)res->GetDesc().DepthOrArraySize);
@@ -341,6 +342,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture3D(const D3D11_TEXTURE3D_DESC
         return E_FAIL;
     }
     DevName(res, L"wwmi mod texture");
+    OwnTexture(res);
 
     WrapTexture3D* w = new WrapTexture3D();
     w->dx12 = res;

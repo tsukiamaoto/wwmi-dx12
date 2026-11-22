@@ -165,8 +165,8 @@ void DispatchDiagMorph(const DispatchArgs& da)
             auto it = &g_command_lists.Gfx(cmd_list);
             if (it != nullptr)
                 for (uint32_t p = 0; p < 64; ++p)
-                    if (it->root[p].table.handle) {
-                        dtabs[ntab] = it->root[p].table;
+                    if (const descriptor_table ct = it->root[p].compute_table(); ct.handle) {
+                        dtabs[ntab] = ct;
                         if (++ntab >= 64) break;
                     }
         }
@@ -210,8 +210,9 @@ void DispatchDiagMorph(const DispatchArgs& da)
                 for (int p = 0; p < 64 && o < 820; ++p)
                     if (si->root[p].va) o += snprintf(buf + o, sizeof(buf) - o, "rootVA[%d] ", p);
                 for (int p = 0; p < 64 && o < 780; ++p) {
-                    if (!si->root[p].table.handle) continue;
-                    const TableStart ts = TableStartOf(dev, si->root[p].table);
+                    const descriptor_table ct = si->root[p].compute_table();
+                    if (!ct.handle) continue;
+                    const TableStart ts = TableStartOf(dev, ct);
                     o +=
                         snprintf(buf + o, sizeof(buf) - o, "tbl[%d]@%llx+%u ", p, (unsigned long long)ts.heap, ts.base);
                 }

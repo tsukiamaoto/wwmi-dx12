@@ -152,10 +152,13 @@ bool ReflectShader(struct ShaderCode& sc);
 
 void TransitionResource(ID3D12GraphicsCommandList* cl, ID3D11Resource* res, D3D12_RESOURCE_STATES to);
 
-// Buffers OURS (mod geometry, relocations): their state per list, and the UAV barriers owed on them.
+// Buffers and textures OURS (mod geometry, relocations, IniParams, mod textures):
+// their state per list, and the UAV barriers owed on them.
 void OwnBuffer(ID3D12Resource* res);
+void OwnTexture(ID3D12Resource* res);
 void DisownBuffer(ID3D12Resource* res);
 bool OwnedBuffer(ID3D12Resource* res);
+bool OwnedTexture(ID3D12Resource* res);
 D3D12_RESOURCE_STATES OwnedTransition(ID3D12GraphicsCommandList* cl, ID3D12Resource* res, D3D12_RESOURCE_STATES to);
 void ListBuffersToCommon(ID3D12GraphicsCommandList* cl);
 void FlushUavBarriers(ID3D12GraphicsCommandList* cl);
@@ -172,6 +175,7 @@ bool CopyBufferCs(ID3D12GraphicsCommandList* cl, struct WrapResource* dst, UINT6
 void QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t seq = 0);
 void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data, UINT subresources, uint64_t seq = 0);
 void FlushPendingUploads(ID3D12GraphicsCommandList* cl);
+void DiscardRedrawUploads();
 bool UploadPendingFor(ID3D11Resource* res); // its copy is not recorded on a command list yet
 uint64_t NextUploadSeq();
 bool ListHoldsUpload(ID3D12GraphicsCommandList* cl, const struct WrapResource* wr);

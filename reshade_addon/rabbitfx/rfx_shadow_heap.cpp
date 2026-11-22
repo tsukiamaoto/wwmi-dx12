@@ -1,4 +1,5 @@
 #include "rfx_shadow_heap.h"
+#include "../core/d3d12_name.h"
 #include "../core/gpu_progress.h"
 #include "../core/log.h"
 #include "../addon/addon.h"
@@ -14,6 +15,7 @@ bool RfxShadowHeap::Ensure(ID3D12Device* dev)
     d.NumDescriptors = 262144;
     d.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(dev->CreateDescriptorHeap(&d, IID_PPV_ARGS(&heap_)))) return false;
+    DevName(heap_.Get(), L"wwmi rfx shadow heap");
     cap_ = d.NumDescriptors;
     return true;
 }
@@ -55,6 +57,7 @@ bool RfxShadowHeap::ReserveLocked(uint32_t n)
         d.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> h;
         if (FAILED(g_addon.d3d12_device->CreateDescriptorHeap(&d, IID_PPV_ARGS(&h)))) return false;
+        DevName(h.Get(), L"wwmi rfx shadow heap");
         retired_.push_back({ heap_, now });
         heap_ = h;
         cap_ = size;
