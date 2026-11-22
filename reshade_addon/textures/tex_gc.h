@@ -92,6 +92,7 @@ private:
     uint64_t quiet_ms_ = 0; // last collection that could not act on tight or a raise
     uint64_t raise_quiet_ms_ = 0; // last collection that lowered or let go while tight
     uint64_t tight_ms_ = 0; // when tight began
+    uint64_t raw_tight_ms_ = 0; // when raw VRAM pressure began (for debouncing transient WDDM budget dips)
     bool tight_ = false;
     bool raise_ready_ = false;
     bool far_due_ = false; // A20: something to go down, or textures it has not tracked yet

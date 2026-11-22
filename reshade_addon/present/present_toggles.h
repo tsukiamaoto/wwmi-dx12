@@ -8,7 +8,7 @@ struct PresentToggles {
     bool skip_engine_tick = false; // A9: perf A/B only -- no [Present] lists, no present pass; mods stop updating
     bool frame_end_step =
         true; // presents from another thread (frame generation): the per-frame step at the game's own frame end (Numpad 7)
-    bool on_game_queue = false;
+    bool on_game_queue = true;
     bool flush_immediate_first = true;
     bool allow_buffer_resize = true;
     bool health_heartbeat = true; // log the counters that GROW, every 600 frames

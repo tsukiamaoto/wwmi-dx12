@@ -28,6 +28,7 @@ constexpr uint64_t kSettleMs = 1000;
 constexpr uint64_t kQuietMs = 5000; // after a collection that could not act on tight or a raise, before they ask again
 constexpr uint64_t kIdleMs[3] = { 5000, 10000, 60000 }; // unseen this long: 0 and 1 give way first, 2 goes down to 1
 constexpr uint64_t kOnScreenMs = 3000; // tight this long before what is on screen is lowered
+constexpr uint64_t kTightDebounceMs = 4000; // sustained pressure before entering tight mode (filters WDDM budget dips)
 constexpr auto kAfterPass = std::chrono::seconds(1); // a pass's old copies die after it, still in the usage meanwhile
 constexpr uint64_t kFarMs = 5000; // A20: drawn smaller through this long before it goes down to match
 constexpr unsigned kMaxLower = 64;
@@ -56,6 +57,12 @@ unsigned DrawnDown(
     if (!g_settings.tex_distance) return 0;
     const unsigned k = g_mod_textures.Sharpest(index, since);
     return k == ModTextureStore::kMipUnknown ? 0 : k;
+}
+bool GameForeground()
+{
+    DWORD pid = 0;
+    if (HWND fg = GetForegroundWindow()) GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
 }
 } // namespace
 
@@ -159,8 +166,20 @@ void TexGc::Sample(uint64_t now, bool loading)
         reading_.headroom = margin + band;
         reading_.card = v.card;
     }
+    const bool over_card = reading_.valid && reading_.card && reading_.used > reading_.card;
+    const bool focused = GameForeground();
+    // WDDM routinely halves an unfocused DX12 process's budget on Alt-Tab; avoid evicting mod textures
+    // while backgrounded unless another workload creates genuine severe VRAM pressure (< 25% of card).
+    const bool bg_severe = over_card || (reading_.valid && reading_.card && reading_.budget < reading_.card / 4);
+    const bool raw_tight = reading_.valid && (focused || bg_severe) &&
+        (mods > reading_.available || (tight_ && mods > reading_.room));
+    if (raw_tight) {
+        if (!raw_tight_ms_) raw_tight_ms_ = now;
+    } else {
+        raw_tight_ms_ = 0;
+    }
     const bool was = tight_;
-    tight_ = reading_.valid && (mods > reading_.available || (tight_ && mods > reading_.room));
+    tight_ = raw_tight && (was || over_card || now - raw_tight_ms_ >= kTightDebounceMs);
     if (tight_ && !was) tight_ms_ = now;
     if (reading_.valid && (first || tight_ != was)) {
         std::string budget_line;

@@ -22,7 +22,8 @@ public:
     void Stop();
     ~TexDefer()
     {
-        if (thread_.joinable()) thread_.detach();
+        for (std::thread& t : threads_)
+            if (t.joinable()) t.detach();
     }
 
 private:
@@ -54,10 +55,21 @@ private:
         unsigned gen;
     };
     std::unordered_map<std::wstring, Return> returns_; // under mtx_
+    struct BurstStats {
+        bool active = false;
+        long long t0 = 0;
+        unsigned total = 0;
+        unsigned made = 0;
+        unsigned stale = 0;
+        unsigned smaller = 0;
+        long long locked = 0;
+        long long longest = 0;
+        std::vector<std::wstring> namespaces;
+    } burst_; // under mtx_
     std::mutex mtx_;
     std::condition_variable cv_;
     bool stop_ = false; // under mtx_
-    std::thread thread_; // started under mtx_
+    std::vector<std::thread> threads_; // worker pool, started lazily under mtx_
 };
 extern TexDefer g_tex_defer;
 

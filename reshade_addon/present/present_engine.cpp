@@ -80,7 +80,7 @@ ID3D12GraphicsCommandList* EngineFrame::Pass::Begin()
     return cl.Get();
 }
 
-HRESULT EngineFrame::Pass::Submit(ID3D12CommandQueue* game_queue)
+HRESULT EngineFrame::Pass::Submit(ID3D12CommandQueue* game_queue, ID3D12Fence* wait_fence, uint64_t wait_value)
 {
     if (!ready || !game_queue) return E_POINTER;
     HotPath::GpuOwnListEnd(cl.Get(), game_queue);
@@ -94,6 +94,7 @@ HRESULT EngineFrame::Pass::Submit(ID3D12CommandQueue* game_queue)
                 (int)game_queue->GetDesc().Type);
         return E_INVALIDARG;
     }
+    if (wait_fence && wait_value) game_queue->Wait(wait_fence, wait_value);
     ID3D12CommandList* lists[] = { cl.Get() };
     RemovalPin::OnExecute(g_addon.d3d12_device, cl.Get(), (int)D3D12_COMMAND_LIST_TYPE_DIRECT,
         (int)game_queue->GetDesc().Type, "present-pass submit");
@@ -110,6 +111,33 @@ HRESULT EngineFrame::Pass::Submit(ID3D12CommandQueue* game_queue)
     g_gpu_timer.FrameSubmitted(fence.Get(), slot_fence[slot], game_queue);
     HotPath::GpuFrameSubmitted(fence.Get(), slot_fence[slot], game_queue);
     return hr;
+}
+
+void EngineFrame::Pass::Discard()
+{
+    if (!ready) return;
+    MigotoPort::ListBuffersForget(cl.Get());
+    cl->Close();
+}
+
+ID3D12CommandQueue* EngineFrame::GameDrawQueue() const
+{
+    if (const void* gq = g_frames.claim_exec_queue.load(std::memory_order_relaxed)) {
+        auto* q = reinterpret_cast<ID3D12CommandQueue*>(const_cast<void*>(gq));
+        if (q && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) return q;
+    }
+    if (const uint64_t sq = g_frames.game_submit_queue.load(std::memory_order_relaxed)) {
+        auto* q = reinterpret_cast<ID3D12CommandQueue*>(static_cast<uintptr_t>(sq));
+        if (q && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) return q;
+    }
+    return nullptr;
+}
+
+bool EngineFrame::HasSeparateGameQueue(command_queue* present_queue) const
+{
+    if (!present_queue) return false;
+    ID3D12CommandQueue* const gq = GameDrawQueue();
+    return gq != nullptr && gq != reinterpret_cast<ID3D12CommandQueue*>(present_queue->get_native());
 }
 
 void EngineFrame::ProbeTick(command_queue* queue, swapchain* sc)
@@ -205,14 +233,15 @@ void EngineFrame::GameClient(float& rw, float& rh, bool& focused)
 void EngineFrame::Redraw(command_queue* queue, swapchain* sc)
 {
     PROF(PROF_EngineTick);
-    if (!g_draw_toggles.wwmi_geom || !present_pass_.Init(g_addon.d3d12_device)) return;
+    if (!g_draw_toggles.wwmi_geom) return;
+    std::lock_guard l(mutex_);
+    if (!present_pass_.Init(g_addon.d3d12_device)) return;
     float rw = 0;
     float rh = 0;
     bool focused = false;
     GameClient(rw, rh, focused);
     ID3D12GraphicsCommandList* const present_cl = present_pass_.Begin();
     if (!present_cl) return;
-    std::lock_guard l(mutex_);
     auto* const dev12 = (ID3D12Device*)sc->get_device()->get_native();
     auto* const q12 = (ID3D12CommandQueue*)queue->get_native();
     PortApi::SetFrameContext(dev12, present_cl, q12, (unsigned)rw, (unsigned)rh, DXGI_FORMAT_UNKNOWN,
@@ -220,15 +249,18 @@ void EngineFrame::Redraw(command_queue* queue, swapchain* sc)
         nullptr);
     const unsigned long long own_draws_before = MigotoPort::OwnListDrawsIssued();
     PortApi::PresentRedraw();
-    ID3D12CommandQueue* subq = q12;
-    if (g_present_toggles.on_game_queue)
-        if (const void* gq = g_frames.claim_exec_queue.load(std::memory_order_relaxed))
-            subq = reinterpret_cast<ID3D12CommandQueue*>(const_cast<void*>(gq));
-    if (g_present_toggles.flush_immediate_first && MigotoPort::OwnListDrawsIssued() != own_draws_before)
-        queue->flush_immediate_command_list();
-    MigotoPort::FlushPendingUploads(present_cl);
-    MigotoPort::BackBufferRestore(present_cl, D3D12_RESOURCE_STATE_PRESENT);
-    present_pass_.Submit(subq);
+    const bool drew = (MigotoPort::OwnListDrawsIssued() != own_draws_before);
+    MigotoPort::DiscardRedrawUploads();
+    if (drew) {
+        if (g_present_toggles.flush_immediate_first) queue->flush_immediate_command_list();
+        MigotoPort::BackBufferRestore(present_cl, D3D12_RESOURCE_STATE_PRESENT);
+        // Strictly one-way GPU sync: wait for the game-queue [Present] step before drawing overlays on the present queue.
+        ID3D12Fence* const wait_f =
+            (q12 != last_step_queue_ && step_fence_ && step_fence_val_ > 0) ? step_fence_.Get() : nullptr;
+        present_pass_.Submit(q12, wait_f, wait_f ? step_fence_val_ : 0);
+    } else {
+        present_pass_.Discard();
+    }
     PortApi::SetFrameContext(dev12, nullptr, q12, (unsigned)rw, (unsigned)rh, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
         nullptr, D3D12_RESOURCE_STATE_COMMON, nullptr);
 }
@@ -337,11 +369,13 @@ void EngineFrame::PresentPasses(Frame& f, std::vector<ChainProf>& cp)
 {
     PROF(PROF_ET_Lists);
     {
-        ID3D12CommandQueue* qs[3] = { (ID3D12CommandQueue*)f.queue->get_native(),
+        ID3D12CommandQueue* qs[4] = { (ID3D12CommandQueue*)f.queue->get_native(),
             reinterpret_cast<ID3D12CommandQueue*>(
                 const_cast<void*>(g_frames.claim_exec_queue.load(std::memory_order_relaxed))),
+            reinterpret_cast<ID3D12CommandQueue*>(
+                static_cast<uintptr_t>(g_frames.game_submit_queue.load(std::memory_order_relaxed))),
             reinterpret_cast<ID3D12CommandQueue*>(g_frames.present_queue.load(std::memory_order_relaxed)) };
-        GpuProgressTick((ID3D12Device*)f.sc->get_device()->get_native(), qs, 3);
+        GpuProgressTick((ID3D12Device*)f.sc->get_device()->get_native(), qs, 4);
     }
 #ifdef WWMI_DEBUG
     if (g_tex_trace.Armed()) g_tex_trace.Line("present: the [Present] pre pass runs");
@@ -349,15 +383,28 @@ void EngineFrame::PresentPasses(Frame& f, std::vector<ChainProf>& cp)
     PortApi::PresentPre(); // their [Present] pre pass
     if (f.focused) PortApi::TickInput();
     bool on_screen = false;
+    bool switched_on = false;
     for (GeoMod& gm : Mods().Units()) {
         gm.det_at_keys = gm.wcl_ns.empty() ? -1.f : PortApi::GetVarNs(gm.wcl_ns.c_str(), L"object_detected", -1.f);
         on_screen |= gm.det_at_keys > 0.f;
+        const bool was = gm.geom_enabled;
+        gm.geom_enabled = gm.wcl_ns.empty() || PortApi::GetVarNs(gm.wcl_ns.c_str(), L"mod_enabled", 1.f) != 0.f;
+        switched_on |= !was && gm.geom_enabled;
+        if (was && !gm.geom_enabled) {
+            g_tex_place.UnstampSwitchedOff(gm.wcl_ns.c_str());
+            g_tex_place.WatchSwitchedOff(gm.wcl_ns.c_str());
+        }
     }
     if (g_frame_id % 600u == 300u) g_tex_place.Report();
-    if (g_frame_id % 10u == 0u)
+    if (switched_on || g_frame_id % 10u == 0u)
         for (GeoMod& gm : Mods().Units())
             if (gm.det_at_keys > 0.f) g_tex_place.SnapshotSelections(gm.wcl_ns.c_str());
-    if (on_screen && g_frame_id - held_retry_frame_ >= 30) {
+    if (switched_on) {
+        g_tex_place.WatchSwitchedOn();
+        g_tex_place.RetryMissed("a mod switched itself back on");
+        if (g_debug) g_diag_arms.sectex_watch.store(3, std::memory_order_relaxed);
+    }
+    if (on_screen && g_frame_id - held_retry_frame_ >= 6) {
         held_retry_frame_ = g_frame_id;
         g_tex_place.RetryMissed("a mod's object is on screen", true);
     }
@@ -374,19 +421,20 @@ void EngineFrame::PresentPasses(Frame& f, std::vector<ChainProf>& cp)
     PortApi::PresentPost(); // their [Present] post pass (e.g. WWMI `post $object_detected = 0`)
     if (g_diag_arms.sectex_watch.load(std::memory_order_relaxed) > 0)
         g_diag_arms.sectex_watch.fetch_sub(1, std::memory_order_relaxed);
-    bool switched_on = false;
+    bool post_switched_on = false;
     for (GeoMod& gm : Mods().Units()) {
         const bool was = gm.geom_enabled;
         gm.geom_enabled = gm.wcl_ns.empty() || PortApi::GetVarNs(gm.wcl_ns.c_str(), L"mod_enabled", 1.f) != 0.f;
-        switched_on |= !was && gm.geom_enabled;
+        post_switched_on |= !was && gm.geom_enabled;
         if (was && !gm.geom_enabled) {
             g_tex_place.UnstampSwitchedOff(gm.wcl_ns.c_str());
             g_tex_place.WatchSwitchedOff(gm.wcl_ns.c_str());
         }
     }
-    if (switched_on) {
+    if (post_switched_on) {
         g_tex_place.WatchSwitchedOn();
-        g_tex_place.RetryMissed("a mod switched itself back on");
+        // PresentPost already cleared $object_detected; defer retry to the next between-passes window.
+        g_tex_place.RetryMissedBetweenPasses("a mod switched itself back on");
         if (g_debug) g_diag_arms.sectex_watch.store(3, std::memory_order_relaxed);
     }
 }
@@ -398,11 +446,11 @@ void EngineFrame::SubmitList(Frame& f)
     auto* q12 = (ID3D12CommandQueue*)f.queue->get_native();
     ID3D12CommandQueue* subq = q12;
     if (g_present_toggles.on_game_queue) {
-        const void* gq = g_frames.claim_exec_queue.load(std::memory_order_relaxed);
-        if (gq) subq = reinterpret_cast<ID3D12CommandQueue*>(const_cast<void*>(gq));
+        if (ID3D12CommandQueue* const gq = GameDrawQueue()) subq = gq;
     }
     {
-        const int now = (subq == q12) ? 0 : 1;
+        const void* pq = g_frames.present_queue.load(std::memory_order_relaxed);
+        const int now = ((pq && subq != pq) || subq != q12) ? 1 : 0;
         if (now != x18_last_) {
             x18_last_ = now;
             logger::write(
@@ -419,12 +467,20 @@ void EngineFrame::SubmitList(Frame& f)
     const bool x34 = g_present_toggles.flush_immediate_first && MigotoPort::OwnListDrawsIssued() != f.own_draws_before;
     if (x34) f.queue->flush_immediate_command_list();
     MigotoPort::FlushPendingUploads(f.cl);
-    IbHash::Record(f.cl); // the frame's one mesh hash rides this list: no second queue, no second signal
+    IbHash::DrainQueue(); // collect any finished GPU hashes before recording the next batch (no 1-frame idle bubble)
+    IbHash::Record(f.cl); // mesh hashes ride this list: no second queue, no second signal
     // Leave the back buffer as ReShade's effects and next frame's game barriers expect it.
     MigotoPort::BackBufferRestore(f.cl, D3D12_RESOURCE_STATE_PRESENT);
     HotPath::GpuBracketEnd(f.cl, f.hp);
     g_gpu_timer.End(f.cl, f.gt);
     const HRESULT pd_close = f.pass->Submit(subq);
+    if (SUCCEEDED(pd_close) && dev12 && subq) {
+        if (!step_fence_) dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&step_fence_));
+        if (step_fence_ && SUCCEEDED(subq->Signal(step_fence_.Get(), step_fence_val_ + 1))) {
+            ++step_fence_val_;
+            last_step_queue_ = subq;
+        }
+    }
     if (pd_probe) {
         logger::write("PRESENTDRAW frame f=%u present_cl=%p close_hr=%08lX queue=%p (on_present queue %p) "
                       "bb=%p index=%u observed_state=0x%x swapchain=%p color_space=%u x34_flushed=%d",
@@ -492,12 +548,10 @@ void EngineFrame::Tick(command_queue* queue, swapchain* sc, bool bind_back_buffe
         // WWMI's first-run guide is dismissed with F10, which is gated off: never let it open.
         if (PortApi::GetVarNs(L"WWMIv1", L"first_run", 0.f) != 0.f) PortApi::SetVarNs(L"WWMIv1", L"first_run", 0.f);
         PresentPasses(f, cp);
-        if (f.cl)
-            g_skeleton_dump.ChainTick(
-                (ID3D12Device*)sc->get_device()->get_native(), f.cl, (ID3D12CommandQueue*)queue->get_native());
-        if (f.cl)
-            g_skeleton_dump.MergedTick(
-                (ID3D12Device*)sc->get_device()->get_native(), f.cl, (ID3D12CommandQueue*)queue->get_native());
+        ID3D12CommandQueue* const dump_q =
+            (g_present_toggles.on_game_queue && GameDrawQueue()) ? GameDrawQueue() : (ID3D12CommandQueue*)queue->get_native();
+        if (f.cl) g_skeleton_dump.ChainTick((ID3D12Device*)sc->get_device()->get_native(), f.cl, dump_q);
+        if (f.cl) g_skeleton_dump.MergedTick((ID3D12Device*)sc->get_device()->get_native(), f.cl, dump_q);
 
         for (const ChainProf& c : cp) {
             const float od_post = PortApi::GetVarNs(c.ns.c_str(), L"object_detected", -1.f);

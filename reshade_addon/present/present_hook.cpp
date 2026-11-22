@@ -183,7 +183,12 @@ void FrameStepper::OnPresent(command_queue* queue, swapchain* sc)
         if (!g_present_toggles.skip_engine_tick) g_engine_frame.Redraw(queue, sc);
         return;
     }
-    Step(queue, sc, true);
+    const bool split_queue = g_present_toggles.on_game_queue && g_engine_frame.HasSeparateGameQueue(queue);
+    Step(queue, sc, !split_queue);
+    if (split_queue && !g_present_toggles.skip_engine_tick) {
+        ModSetRef set_ref;
+        g_engine_frame.Redraw(queue, sc);
+    }
 }
 
 void FrameStepper::Step(command_queue* queue, swapchain* sc, bool at_present)
@@ -196,14 +201,18 @@ void FrameStepper::Step(command_queue* queue, swapchain* sc, bool at_present)
         .UpdateSkinBand(); // keep the skin-pool VA band tracking the learned char VB0s (auto re-derive across patches)
     g_present_diag.SeedHeartbeat();
     g_mod_textures.Tick();
+    g_tex_replace.SweepDying(); // forget retired/destroyed store entries before PresentPre -> UploadFrameTick releases them
+    g_mod_textures_load.Tick(); // describe finished TexDefer textures before Tick() so stamping + upload flush happen this frame
     if (!g_present_toggles.skip_engine_tick) g_engine_frame.Tick(queue, sc, at_present);
     DrainModSets();
     g_watchdogs.StartRemoval(sc);
     g_buffer_reloc.Sweep(sc->get_device());
-    g_mod_textures_load.Tick();
-    g_tex_replace.Tick((ID3D12CommandQueue*)queue->get_native());
+    ID3D12CommandQueue* const work_q = (g_present_toggles.on_game_queue && g_engine_frame.GameDrawQueue())
+        ? g_engine_frame.GameDrawQueue()
+        : (ID3D12CommandQueue*)queue->get_native();
+    g_tex_replace.Tick(work_q);
     g_tex_budget.Tick();
-    g_tex_encode_test.Tick((ID3D12CommandQueue*)queue->get_native());
+    g_tex_encode_test.Tick(work_q);
     g_tex_encoder.Tick();
     if (g_draw_toggles.wwmi_geom) {
         uint32_t gc = g_draw_stats.wwmi_geom_count.load();

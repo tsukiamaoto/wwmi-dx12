@@ -18,6 +18,8 @@ public:
     // Held through a step and a redraw: they share the port's frame context, and with frame generation run on two
     // threads.
     std::mutex& Mutex() { return mutex_; }
+    ID3D12CommandQueue* GameDrawQueue() const;
+    bool HasSeparateGameQueue(reshade::api::command_queue* present_queue) const;
 
 private:
     struct Pass {
@@ -33,7 +35,8 @@ private:
         bool ready = false;
         bool Init(ID3D12Device* dev);
         ID3D12GraphicsCommandList* Begin();
-        HRESULT Submit(ID3D12CommandQueue* game_queue);
+        HRESULT Submit(ID3D12CommandQueue* queue, ID3D12Fence* wait_fence = nullptr, uint64_t wait_value = 0);
+        void Discard();
     };
     struct ChainProf {
         std::wstring ns;
@@ -65,6 +68,9 @@ private:
 
     Pass present_pass_;
     Pass frame_end_pass_; // the step's list when it runs at the game's frame end, on the game's thread
+    Microsoft::WRL::ComPtr<ID3D12Fence> step_fence_;
+    uint64_t step_fence_val_ = 0;
+    ID3D12CommandQueue* last_step_queue_ = nullptr;
     std::mutex mutex_;
     HWND game_hwnd_ = nullptr;
     bool port_tried_ = false;
