@@ -668,8 +668,8 @@ bool TextureHashHasSections(uint32_t hash)
 }
 
 } // namespace PortApi
-// Is every command of `cl` one a skip section may hold (see ForEachSkipTextureOverride)? Counts the skips.
-static bool SkipSectionBodyIsSafe(const CommandList* cl, int* skips)
+// Is every command of `cl` one a skip/var section may hold? Counts skips and variable assignments.
+static bool SkipSectionBodyIsSafe(const CommandList* cl, int* skips, int* assigns)
 {
     if (!cl) return true;
     for (const auto& c : cl->commands) {
@@ -678,12 +678,16 @@ static bool SkipSectionBodyIsSafe(const CommandList* cl, int* skips)
             ++*skips;
             continue;
         }
-        if (dynamic_cast<AssignmentCommand*>(cmd) || dynamic_cast<CommandPlaceholder*>(cmd)) continue;
+        if (dynamic_cast<AssignmentCommand*>(cmd)) {
+            ++*assigns;
+            continue;
+        }
+        if (dynamic_cast<CommandPlaceholder*>(cmd)) continue;
         if (auto* ic = dynamic_cast<IfCommand*>(cmd)) {
-            if (SkipSectionBodyIsSafe(ic->true_commands_pre.get(), skips) &&
-                SkipSectionBodyIsSafe(ic->true_commands_post.get(), skips) &&
-                SkipSectionBodyIsSafe(ic->false_commands_pre.get(), skips) &&
-                SkipSectionBodyIsSafe(ic->false_commands_post.get(), skips))
+            if (SkipSectionBodyIsSafe(ic->true_commands_pre.get(), skips, assigns) &&
+                SkipSectionBodyIsSafe(ic->true_commands_post.get(), skips, assigns) &&
+                SkipSectionBodyIsSafe(ic->false_commands_pre.get(), skips, assigns) &&
+                SkipSectionBodyIsSafe(ic->false_commands_post.get(), skips, assigns))
                 continue;
             return false;
         }
@@ -700,9 +704,16 @@ static void ForEachSafeTextureOverride(void (*cb)(uint32_t, const wchar_t*, void
         for (TextureOverride& to : kv.second) {
             if (to.match_first_index.op != FuzzyMatchOp::ALWAYS) continue; // ranged: a component's own section
             int skips = 0;
+            int assigns = 0;
             int post_skips = 0;
-            if (!SkipSectionBodyIsSafe(&to.command_list, &skips) || (need_skip && !skips)) continue;
-            if (!SkipSectionBodyIsSafe(&to.post_command_list, &post_skips)) continue;
+            int post_assigns = 0;
+            if (!SkipSectionBodyIsSafe(&to.command_list, &skips, &assigns)) continue;
+            if (!SkipSectionBodyIsSafe(&to.post_command_list, &post_skips, &post_assigns)) continue;
+            if (need_skip) {
+                if (!skips) continue;
+            } else {
+                if (!(assigns + post_assigns)) continue; // skip empty metadata and pure-skip sections
+            }
             cb(kv.first, to.ini_section.c_str(), user);
         }
     }

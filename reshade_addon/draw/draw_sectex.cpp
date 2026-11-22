@@ -203,6 +203,10 @@ uint16_t SectionTexturePublisher::Publish(command_list* cmd_list, int dm, int co
                     : 0u;
                 PortApi::PushGameTexture('p', r, ri.res, known ? hash : resident, fmt);
                 pushed |= (uint16_t)(1u << r);
+                if (g_recognition.ModelHashAny()) {
+                    if (resident) g_recognition.NoteModelDrawn(resident);
+                    if (hash && hash != resident) g_recognition.NoteModelDrawn(hash);
+                }
             }
             if (!known) return;
             if (g_debug) {

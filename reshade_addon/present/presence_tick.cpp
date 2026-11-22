@@ -40,65 +40,31 @@ void PresenceTriggers::Tick()
         g_cs_trigs_snap = std::make_shared<const std::vector<CsTrig>>(); // nothing fires until the rebuild publishes
     }
     if (!ps.built && g_tex_rules.Ready()) {
-        PortApi::ForEachTextureOverride(
-            [](uint32_t hash, const wchar_t* fq, bool ranged, const wchar_t*, bool, void* user) {
-                auto* out = (std::vector<std::pair<std::wstring, std::wstring>>*)user;
-                if (!fq) return;
-                if (ranged) return; // driven per-draw by draw_comp
-                const wchar_t* leaf = wcsrchr(fq, L'\\');
-                if (!leaf) return; // no namespace: a global section
-                if (_wcsnicmp(leaf + 1, L"component", 9) == 0) return; // draw-triggered
-                if (hash && g_tex_rules.Now().hash_to_rule.count(hash)) return;
-                const wchar_t* ns_beg = wcschr(fq, L'\\'); // skip the type prefix
-                if (!ns_beg || ns_beg >= leaf) return;
-                if (SectionReadsPipelineState(fq)) {
-                    std::lock_guard<std::mutex> l(g_cs_trigs_mtx);
-                    g_cs_trigs.push_back({ std::wstring(ns_beg + 1, leaf), std::wstring(fq), hash });
-                    return;
-                }
-                out->emplace_back(std::wstring(ns_beg + 1, leaf), std::wstring(fq));
-            },
-            &ps.trigs);
-        ps.built = true;
-        { // the skip sections: texture targets are the texture pipeline's, the rest are meshes
-            auto skips = std::make_shared<std::unordered_set<uint32_t>>();
-            PortApi::ForEachSkipTextureOverride(
-                [](uint32_t hash, const wchar_t* fq, void* user) {
-                    if (!hash || g_tex_rules.Now().hash_to_rule.count(hash)) return;
-                    ((std::unordered_set<uint32_t>*)user)->insert(hash);
-                    logger::write("SKIPONLY: %08x [%ls] -- a game draw of this mesh is dropped", hash, fq ? fq : L"?");
-                },
-                skips.get());
-            g_recognition.SetSkipVbHashes(
-                skips->empty() ? nullptr : std::shared_ptr<const std::unordered_set<uint32_t>>(skips));
-        }
+        // Variable-only [TextureOverride] sections (both GeoMod and companion namespaces) are hash-gated:
+        // they must ONLY run when their own hash is actually drawn/bound, never blindly every frame a GeoMod is on screen.
+        std::unordered_set<std::wstring> var_sections;
         {
-            auto meshes = std::make_shared<std::unordered_set<uint32_t>>();
-            PortApi::ForEachVarTextureOverride(
-                [](uint32_t hash, const wchar_t* fq, void* user) {
-                    if (!hash || g_tex_rules.Now().hash_to_rule.count(hash)) return;
-                    if (((std::unordered_set<uint32_t>*)user)->insert(hash).second)
-                        logger::write(
-                            "SMALLMESH: %08x [%ls] -- run when a small unskinned draw's vertex buffer hashes to it",
-                            hash, fq ? fq : L"?");
-                },
-                meshes.get());
-            g_recognition.SetSmallMeshHashes(
-                meshes->empty() ? nullptr : std::shared_ptr<const std::unordered_set<uint32_t>>(meshes));
-        }
-        {
+            struct VarCtx {
+                std::vector<PerSet::ModelFlag>* flags;
+                std::unordered_set<std::wstring>* names;
+                std::unordered_set<uint32_t>* small_meshes;
+            };
+            auto small_meshes = std::make_shared<std::unordered_set<uint32_t>>();
+            VarCtx vctx{ &ps.model_flags, &var_sections, small_meshes.get() };
             PortApi::ForEachVarTextureOverride(
                 [](uint32_t hash, const wchar_t* fq, void* user) {
                     if (!hash || !fq || g_tex_rules.Now().hash_to_rule.count(hash)) return;
-                    const wchar_t* a = wcschr(fq, L'\\');
-                    const wchar_t* z = wcsrchr(fq, L'\\');
-                    if (!a || z <= a) return;
-                    const size_t n = (size_t)(z - a - 1);
-                    for (const GeoMod& gm : Mods().Units())
-                        if (gm.wcl_ns.size() == n && _wcsnicmp(gm.wcl_ns.c_str(), a + 1, n) == 0) return;
-                    ((std::vector<PerSet::ModelFlag>*)user)->push_back(PerSet::ModelFlag{ hash, fq, {} });
+                    auto* c = (VarCtx*)user;
+                    c->names->insert(fq);
+                    if (c->small_meshes->insert(hash).second)
+                        logger::write(
+                            "SMALLMESH: %08x [%ls] -- run when a small unskinned draw's vertex buffer hashes to it",
+                            hash, fq);
+                    c->flags->push_back(PerSet::ModelFlag{ hash, fq, {} });
                 },
-                &ps.model_flags);
+                &vctx);
+            g_recognition.SetSmallMeshHashes(
+                small_meshes->empty() ? nullptr : std::shared_ptr<const std::unordered_set<uint32_t>>(small_meshes));
             auto hashes = std::make_shared<std::unordered_set<uint32_t>>();
             size_t on_mods = 0;
             for (PerSet::ModelFlag& mf : ps.model_flags) {
@@ -113,9 +79,61 @@ void PresenceTriggers::Tick()
             }
             g_recognition.SetModelHashes(
                 hashes->empty() ? nullptr : std::shared_ptr<const std::unordered_set<uint32_t>>(hashes));
-            logger::write("MODELFLAGS: %zu variable-only section(s) of other mods keyed to a mesh hash, %zu on a loaded "
-                          "mod's mesh -- run once per frame while that mesh is drawn, as DX11 runs them at its draws",
+            logger::write("MODELFLAGS: %zu variable-only section(s) keyed to a mesh/texture hash, %zu on a loaded "
+                          "mod's mesh -- run once per frame only while that hash is drawn or bound",
                 ps.model_flags.size(), on_mods);
+        }
+        struct TrigCtx {
+            std::vector<std::pair<std::wstring, std::wstring>>* out;
+            const std::unordered_set<std::wstring>* var_sections;
+        } tctx{ &ps.trigs, &var_sections };
+        PortApi::ForEachTextureOverride(
+            [](uint32_t hash, const wchar_t* fq, bool ranged, const wchar_t*, bool, void* user) {
+                auto* tc = (TrigCtx*)user;
+                if (!fq) return;
+                if (ranged) return; // driven per-draw by draw_comp
+                const wchar_t* leaf = wcsrchr(fq, L'\\');
+                if (!leaf) return; // no namespace: a global section
+                if (_wcsnicmp(leaf + 1, L"component", 9) == 0) return; // draw-triggered
+                if (hash && g_tex_rules.Now().hash_to_rule.count(hash)) return;
+                const wchar_t* ns_beg = wcschr(fq, L'\\'); // skip the type prefix
+                if (!ns_beg || ns_beg >= leaf) return;
+                if (SectionReadsPipelineState(fq)) {
+                    std::lock_guard<std::mutex> l(g_cs_trigs_mtx);
+                    g_cs_trigs.push_back({ std::wstring(ns_beg + 1, leaf), std::wstring(fq), hash });
+                    return;
+                }
+                if (tc->var_sections->count(fq)) return; // hash-gated via ps.model_flags above
+                const std::wstring ns(ns_beg + 1, leaf);
+                // Only run a hashed non-component section as a presence trigger if its hash is one of this mod's own
+                // claimed mesh hashes (never blindly fire ult/form/skill detectors keyed to unrelated hashes).
+                if (hash) {
+                    bool own_mesh = false;
+                    for (const MergedComp& mc : Comps().All()) {
+                        if (_wcsicmp(Mods().At(mc.mod_id).wcl_ns.c_str(), ns.c_str()) != 0) continue;
+                        const WwmiMod::Component* c = Mods().Comp(mc.mod_id, mc.comp_idx);
+                        if (c && c->ib_hash == hash) {
+                            own_mesh = true;
+                            break;
+                        }
+                    }
+                    if (!own_mesh) return;
+                }
+                tc->out->emplace_back(ns, std::wstring(fq));
+            },
+            &tctx);
+        ps.built = true;
+        { // the skip sections: texture targets are the texture pipeline's, the rest are meshes
+            auto skips = std::make_shared<std::unordered_set<uint32_t>>();
+            PortApi::ForEachSkipTextureOverride(
+                [](uint32_t hash, const wchar_t* fq, void* user) {
+                    if (!hash || g_tex_rules.Now().hash_to_rule.count(hash)) return;
+                    ((std::unordered_set<uint32_t>*)user)->insert(hash);
+                    logger::write("SKIPONLY: %08x [%ls] -- a game draw of this mesh is dropped", hash, fq ? fq : L"?");
+                },
+                skips.get());
+            g_recognition.SetSkipVbHashes(
+                skips->empty() ? nullptr : std::shared_ptr<const std::unordered_set<uint32_t>>(skips));
         }
         size_t ncs = 0;
         {
